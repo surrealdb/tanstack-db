@@ -1,14 +1,14 @@
 {
 	"name": "@surrealdb/tanstack-db",
-	"description": "Add Offline / Local First Caching & Syncing to your SurrealDB app with TanstackDB and Loro (CRDTs)",
+	"description": "Offline / local-first caching and syncing for SurrealDB apps with TanStack DB, with optional client-side CRDTs (Loro)",
 	"version": "1.0.0-alpha.1",
 	"license": "Apache-2.0",
 	"files": [
 		"dist"
 	],
 	"module": "./dist/index.mjs",
-	"main": "./dist/index.js",
-	"types": "./dist/index.d.ts",
+	"main": "./dist/index.cjs",
+	"types": "./dist/index.d.cts",
 	"exports": {
 		".": {
 			"import": {
@@ -16,8 +16,8 @@
 				"default": "./dist/index.mjs"
 			},
 			"require": {
-				"types": "./dist/index.d.ts",
-				"default": "./dist/index.js"
+				"types": "./dist/index.d.cts",
+				"default": "./dist/index.cjs"
 			}
 		},
 		"./package.json": "./package.json"
@@ -38,31 +38,33 @@
 		"url": "git+https://github.com/surrealdb/tanstack-db.git"
 	},
 	"scripts": {
-		"build": "tsup src/index.ts",
+		"build": "tsdown",
+		"typecheck": "tsc -p .",
 		"test": "bun test",
 		"test:integration": "SURREAL_RUN_INTEGRATION=true bun test tests/surreal.integration.test.ts"
 	},
 	"dependencies": {
-		"@tanstack/db-sqlite-persistence-core": "^0.4.12",
+		"@tanstack/db-sqlite-persistence-core": "^1.0.0-rc.1.5",
 		"loro-crdt": "^1.14.1"
 	},
 	"peerDependencies": {
-		"@tanstack/db": "^0.15.2",
+		"@tanstack/db": "^1.0.0-rc.1.5",
 		"@tanstack/query-core": "^5.107.1",
-		"@tanstack/query-db-collection": "~1.4.8",
+		"@tanstack/query-db-collection": "^1.5.2",
 		"@standard-schema/spec": "^1.1.0",
 		"surrealdb": "^2.2.2"
 	},
 	"devDependencies": {
 		"@biomejs/biome": "^2.5.8",
 		"@standard-schema/spec": "^1.1.0",
-		"@tanstack/db": "^0.15.2",
+		"@tanstack/db": "^1.0.0-rc.1.5",
 		"@tanstack/query-core": "^5.107.1",
-		"@tanstack/query-db-collection": "~1.4.8",
-		"@tanstack/react-db": "^0.5.12",
+		"@tanstack/query-db-collection": "^1.5.2",
+		"@tanstack/react-db": "^1.0.0-rc.1.5",
 		"@tanstack/react-query": "^5.107.1",
 		"@types/bun": "^1.3.14",
 		"surrealdb": "^2.2.2",
-		"tsup": "^8.5.1"
+		"tsdown": "^0.23.7",
+		"typescript": "^7.0.2"
 	}
 }

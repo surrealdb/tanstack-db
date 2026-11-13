@@ -84,7 +84,7 @@ describe('id helpers', () => {
 			id: 'products:1',
 			name: 'desk',
 		});
-		expect(out.id instanceof RecordId).toBe(true);
+		expect((out.id as unknown) instanceof RecordId).toBe(true);
 		expect(out.name).toBe('desk');
 	});
 
@@ -136,7 +136,7 @@ describe('id helpers', () => {
 			end_at: surrealDate,
 		});
 
-		expect(out.id instanceof RecordId).toBe(true);
+		expect((out.id as unknown) instanceof RecordId).toBe(true);
 		expect(out.start_at).toBe(jsDate);
 		expect(out.end_at).toBe(surrealDate);
 		expect(out.end_at instanceof DateTime).toBe(true);

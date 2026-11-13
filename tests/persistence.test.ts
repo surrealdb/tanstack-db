@@ -70,7 +70,7 @@ describe('persistence-safe collection ids', () => {
 		const second = createBaseOptions();
 
 		expect(first.id).toBe(second.id);
-		expect(first.id.startsWith('surreal:product:')).toBe(true);
+		expect(first.id?.startsWith('surreal:product:')).toBe(true);
 	});
 
 	it('derives different ids for different query keys', () => {
@@ -117,7 +117,7 @@ describe('persistence-safe collection ids', () => {
 
 		const value = result.value as Product & { id: unknown };
 		expect(value.name).toBe('Desk');
-		expect(value.id instanceof RecordId).toBe(true);
+		expect((value.id as unknown) instanceof RecordId).toBe(true);
 		expect(String(value.id).startsWith('product:')).toBe(true);
 	});
 
@@ -132,7 +132,7 @@ describe('persistence-safe collection ids', () => {
 		});
 
 		expect(wrapped.id).toBe(base.id);
-		expect(wrapped.id.startsWith('persisted-collection:')).toBe(false);
+		expect(wrapped.id?.startsWith('persisted-collection:')).toBe(false);
 	});
 
 	it('provides a helper that removes manual persistence wrapping boilerplate', () => {
@@ -140,7 +140,7 @@ describe('persistence-safe collection ids', () => {
 			queryKey: ['product', 'helper'],
 		});
 
-		expect(options.id.startsWith('surreal:product:')).toBe(true);
+		expect(options.id?.startsWith('surreal:product:')).toBe(true);
 		expect(options.persistence.coordinator.getNodeId()).toBe('test-node');
 	});
 

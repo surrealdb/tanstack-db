@@ -1,9 +1,11 @@
 {
 	"compilerOptions": {
-		"lib": ["ESNext"],
+		"lib": ["ESNext", "DOM"],
 		"target": "ES2024",
 		"module": "ESNext",
 		"moduleResolution": "bundler",
-		"types": ["bun"]
+		"types": ["bun"],
+		"skipLibCheck": true,
+		"noEmit": true
 	}
 }
