@@ -558,10 +558,24 @@ function modernSurrealCollectionOptions<T extends SyncedTable<object>>(
 			);
 			activeSubsets.set(key, ids);
 
+			// Subsets overlap (e.g. an unfiltered query followed by a filtered one),
+			// so a row may already be synced. Re-inserting it is a duplicate-key error.
+			const upsertWrite: typeof ctx.write = (change) => {
+				if (
+					change.type === 'insert' &&
+					typeof ctx.collection?.has === 'function' &&
+					ctx.collection.has(getKey(change.value))
+				) {
+					ctx.write({ ...change, type: 'update' });
+					return;
+				}
+				ctx.write(change);
+			};
+
 			if (!crdtEnabled) {
 				await hydratePlainRows(
 					rows as unknown as Array<Record<string, unknown>>,
-					ctx.write,
+					upsertWrite,
 					ctx.begin,
 					ctx.commit,
 					'insert',
@@ -573,7 +587,7 @@ function modernSurrealCollectionOptions<T extends SyncedTable<object>>(
 			for (const id of ids) {
 				await hydrateCrdtDoc(
 					id,
-					ctx.write,
+					upsertWrite,
 					ctx.begin,
 					ctx.commit,
 					'insert',
@@ -976,9 +990,8 @@ export function persistedSurrealCollectionOptions<
 	const { persistence, schemaVersion, ...surrealConfig } = config;
 
 	return persistedCollectionOptions<
-		T,
-		string,
 		StandardSchemaV1<Omit<T, 'id'> & { id?: T['id'] }, T>,
+		string,
 		UtilsRecord
 	>({
 		persistence,

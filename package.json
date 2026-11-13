@@ -1,7 +1,8 @@
 {
-	"name": "@foretag/tanstack-db-surrealdb",
+	"name": "@surrealdb/tanstack-db",
 	"description": "Add Offline / Local First Caching & Syncing to your SurrealDB app with TanstackDB and Loro (CRDTs)",
-	"version": "0.7.2",
+	"version": "1.0.0-alpha.1",
+	"license": "Apache-2.0",
 	"files": [
 		"dist"
 	],
@@ -29,12 +30,12 @@
 		"local-first"
 	],
 	"author": {
-		"name": "Chiru Boggavarapu",
-		"email": "chiru@foretag.co"
+		"name": "SurrealDB",
+		"url": "https://surrealdb.com"
 	},
 	"repository": {
 		"type": "git",
-		"url": "https://github.com/ForetagInc/tanstack-db-surrealdb"
+		"url": "git+https://github.com/surrealdb/tanstack-db.git"
 	},
 	"scripts": {
 		"build": "tsup src/index.ts",
@@ -42,26 +43,26 @@
 		"test:integration": "SURREAL_RUN_INTEGRATION=true bun test tests/surreal.integration.test.ts"
 	},
 	"dependencies": {
-		"@tanstack/db-sqlite-persistence-core": "^0.2.9",
+		"@tanstack/db-sqlite-persistence-core": "^0.4.12",
 		"loro-crdt": "^1.14.1"
 	},
 	"peerDependencies": {
-		"@tanstack/db": "^0.6.8",
-		"@tanstack/query-core": "^5.101.0",
-		"@tanstack/query-db-collection": "^1.0.39",
+		"@tanstack/db": "^0.15.2",
+		"@tanstack/query-core": "^5.107.1",
+		"@tanstack/query-db-collection": "~1.4.8",
 		"@standard-schema/spec": "^1.1.0",
-		"surrealdb": "^2.0.3"
+		"surrealdb": "^2.2.2"
 	},
 	"devDependencies": {
 		"@biomejs/biome": "^2.5.8",
 		"@standard-schema/spec": "^1.1.0",
-		"@tanstack/db": "^0.6.17",
-		"@tanstack/query-core": "^5.101.4",
-		"@tanstack/query-db-collection": "^1.2.1",
-		"@tanstack/react-db": "^0.1.95",
-		"@tanstack/react-query": "^5.101.4",
+		"@tanstack/db": "^0.15.2",
+		"@tanstack/query-core": "^5.107.1",
+		"@tanstack/query-db-collection": "~1.4.8",
+		"@tanstack/react-db": "^0.5.12",
+		"@tanstack/react-query": "^5.107.1",
 		"@types/bun": "^1.3.14",
-		"surrealdb": "^2.0.8",
+		"surrealdb": "^2.2.2",
 		"tsup": "^8.5.1"
 	}
 }

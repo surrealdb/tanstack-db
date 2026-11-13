@@ -3,6 +3,7 @@ import { QueryClient } from '@tanstack/query-core';
 import {
 	persistedCollectionOptions,
 	type PersistedCollectionPersistence,
+	SingleProcessCoordinator,
 } from '@tanstack/db-sqlite-persistence-core';
 import { RecordId } from 'surrealdb';
 
@@ -35,17 +36,18 @@ const createBaseOptions = (
 const persistence: PersistedCollectionPersistence = {
 	adapter: {
 		loadSubset: async () => [],
+		loadResumeSnapshot: async () => ({
+			rows: [],
+			collectionMetadata: [],
+			latestTerm: 0,
+			latestSeq: 0,
+			latestRowVersion: 0,
+			resetEpoch: 0,
+		}),
 		applyCommittedTx: async () => undefined,
 		ensureIndex: async () => undefined,
 	},
-	coordinator: {
-		getNodeId: () => 'test-node',
-		subscribe: () => () => undefined,
-		publish: () => undefined,
-		isLeader: () => true,
-		ensureLeadership: async () => undefined,
-		requestEnsurePersistedIndex: async () => undefined,
-	},
+	coordinator: new SingleProcessCoordinator('test-node'),
 };
 
 const createPersistedOptions = (

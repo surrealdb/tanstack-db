@@ -1,4 +1,4 @@
-# @foretag/tanstack-db-surrealdb
+# @surrealdb/tanstack-db
 
 TanStack DB collection adapter for SurrealDB JS with:
 
@@ -11,9 +11,9 @@ TanStack DB collection adapter for SurrealDB JS with:
 ## Install
 
 ```sh
-npm install @foretag/tanstack-db-surrealdb
+npm install @surrealdb/tanstack-db
 # or
-bun add @foretag/tanstack-db-surrealdb
+bun add @surrealdb/tanstack-db
 ```
 
 ## Quick Start
@@ -22,7 +22,7 @@ bun add @foretag/tanstack-db-surrealdb
 import { createCollection } from '@tanstack/db';
 import { QueryClient } from '@tanstack/query-core';
 import { Surreal } from 'surrealdb';
-import { surrealCollectionOptions } from '@foretag/tanstack-db-surrealdb';
+import { surrealCollectionOptions } from '@surrealdb/tanstack-db';
 
 const db = new Surreal();
 const queryClient = new QueryClient();
@@ -83,7 +83,7 @@ import {
   openBrowserWASQLiteOPFSDatabase,
 } from '@tanstack/browser-db-sqlite-persistence';
 import { Surreal } from 'surrealdb';
-import { persistedSurrealCollectionOptions } from '@foretag/tanstack-db-surrealdb';
+import { persistedSurrealCollectionOptions } from '@surrealdb/tanstack-db';
 
 const db = new Surreal();
 const queryClient = new QueryClient();
