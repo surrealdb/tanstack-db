@@ -1,19 +1,26 @@
-# @foretag/tanstack-db-surrealdb
+# @surrealdb/tanstack-db
 
 TanStack DB collection adapter for SurrealDB JS with:
 
 - Realtime replication (`LIVE`)
 - Local-first writes
 - Optional E2EE envelopes (`version/algorithm/key_id/nonce/ciphertext`)
-- Optional Loro CRDT replication (`json`, `richtext`)
+- Optional client-side CRDTs with [Loro](https://loro.dev) (`json`, `richtext`)
 - Query-driven sync modes (`eager`, `on-demand`, `progressive`)
+
+> [!IMPORTANT]
+> **CRDTs run on the client, not in SurrealDB.** SurrealDB has no native CRDT
+> support, and this adapter does not add any. Loro merges every change in the
+> client. SurrealDB only stores the encoded Loro updates as ordinary records, and
+> live queries pass them to other clients, which merge them locally. See
+> [How CRDT mode works](#how-crdt-mode-works).
 
 ## Install
 
 ```sh
-npm install @foretag/tanstack-db-surrealdb
+npm install @surrealdb/tanstack-db
 # or
-bun add @foretag/tanstack-db-surrealdb
+bun add @surrealdb/tanstack-db
 ```
 
 ## Quick Start
@@ -22,7 +29,7 @@ bun add @foretag/tanstack-db-surrealdb
 import { createCollection } from '@tanstack/db';
 import { QueryClient } from '@tanstack/query-core';
 import { Surreal } from 'surrealdb';
-import { surrealCollectionOptions } from '@foretag/tanstack-db-surrealdb';
+import { surrealCollectionOptions } from '@surrealdb/tanstack-db';
 
 const db = new Surreal();
 const queryClient = new QueryClient();
@@ -83,7 +90,7 @@ import {
   openBrowserWASQLiteOPFSDatabase,
 } from '@tanstack/browser-db-sqlite-persistence';
 import { Surreal } from 'surrealdb';
-import { persistedSurrealCollectionOptions } from '@foretag/tanstack-db-surrealdb';
+import { persistedSurrealCollectionOptions } from '@surrealdb/tanstack-db';
 
 const db = new Surreal();
 const queryClient = new QueryClient();
@@ -185,6 +192,33 @@ Included provider:
 
 - `WebCryptoAESGCM` (`AES-256-GCM`, versioned envelope)
 
+## How CRDT mode works
+
+CRDT mode (`crdt.enabled: true`) is client-side only. SurrealDB acts as storage
+and transport; it does not merge or resolve conflicts.
+
+| Step | Where it happens |
+|---|---|
+| Apply a local change to the Loro document | Client |
+| Encode the change as Loro update bytes | Client |
+| Store the update bytes (`crdt.updatesTable`, append-only) | SurrealDB, as a plain record |
+| Send new updates to other clients (`LIVE` query) | SurrealDB |
+| Merge updates and build the row value | Client (each client merges independently) |
+| Write snapshots (`crdt.snapshotsTable`) | Your own backend or job; the adapter only reads them |
+
+What this means for you:
+
+- SurrealDB does not understand CRDT content. The update and snapshot tables
+  hold encoded bytes (or E2EE envelopes), so SurrealQL cannot query, merge or
+  validate the document content in them.
+- To query document fields on the server, set `crdt.persistMaterializedView: true`.
+  The client then also writes the merged result to the base table as plain
+  fields. That copy is written by clients, so it is not authoritative.
+- Conflict resolution follows Loro's rules on each client. The server does not
+  resolve conflicts.
+- Table permissions still apply to each record as usual. See
+  [Permissions Templates](#permissions-templates).
+
 ## CRDT Profiles
 
 CRDT is managed by profile by default:
@@ -204,11 +238,11 @@ For CRDT loop-prevention metadata, prefer `crdt.actor` so actor identity can be 
 For `crdt.enabled: true`, users must provide:
 
 - Base table (`table`) for record identity and optional materialized metadata.
-- Updates table (`crdt.updatesTable`) as append-only CRDT log.
+- Updates table (`crdt.updatesTable`) as an append-only log of encoded Loro updates. SurrealDB stores them; clients merge them.
 
 Optional:
 
-- Snapshots table (`crdt.snapshotsTable`) for compaction and faster hydration.
+- Snapshots table (`crdt.snapshotsTable`) for compaction and faster hydration. The adapter reads snapshots but does not write them; produce them from a trusted backend.
 
 If `crdt.updatesTable` is missing, CRDT mode cannot function.
 

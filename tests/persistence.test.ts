@@ -3,6 +3,7 @@ import { QueryClient } from '@tanstack/query-core';
 import {
 	persistedCollectionOptions,
 	type PersistedCollectionPersistence,
+	SingleProcessCoordinator,
 } from '@tanstack/db-sqlite-persistence-core';
 import { RecordId } from 'surrealdb';
 
@@ -35,17 +36,18 @@ const createBaseOptions = (
 const persistence: PersistedCollectionPersistence = {
 	adapter: {
 		loadSubset: async () => [],
+		loadResumeSnapshot: async () => ({
+			rows: [],
+			collectionMetadata: [],
+			latestTerm: 0,
+			latestSeq: 0,
+			latestRowVersion: 0,
+			resetEpoch: 0,
+		}),
 		applyCommittedTx: async () => undefined,
 		ensureIndex: async () => undefined,
 	},
-	coordinator: {
-		getNodeId: () => 'test-node',
-		subscribe: () => () => undefined,
-		publish: () => undefined,
-		isLeader: () => true,
-		ensureLeadership: async () => undefined,
-		requestEnsurePersistedIndex: async () => undefined,
-	},
+	coordinator: new SingleProcessCoordinator('test-node'),
 };
 
 const createPersistedOptions = (
@@ -68,7 +70,7 @@ describe('persistence-safe collection ids', () => {
 		const second = createBaseOptions();
 
 		expect(first.id).toBe(second.id);
-		expect(first.id.startsWith('surreal:product:')).toBe(true);
+		expect(first.id?.startsWith('surreal:product:')).toBe(true);
 	});
 
 	it('derives different ids for different query keys', () => {
@@ -115,7 +117,7 @@ describe('persistence-safe collection ids', () => {
 
 		const value = result.value as Product & { id: unknown };
 		expect(value.name).toBe('Desk');
-		expect(value.id instanceof RecordId).toBe(true);
+		expect((value.id as unknown) instanceof RecordId).toBe(true);
 		expect(String(value.id).startsWith('product:')).toBe(true);
 	});
 
@@ -130,7 +132,7 @@ describe('persistence-safe collection ids', () => {
 		});
 
 		expect(wrapped.id).toBe(base.id);
-		expect(wrapped.id.startsWith('persisted-collection:')).toBe(false);
+		expect(wrapped.id?.startsWith('persisted-collection:')).toBe(false);
 	});
 
 	it('provides a helper that removes manual persistence wrapping boilerplate', () => {
@@ -138,7 +140,7 @@ describe('persistence-safe collection ids', () => {
 			queryKey: ['product', 'helper'],
 		});
 
-		expect(options.id.startsWith('surreal:product:')).toBe(true);
+		expect(options.id?.startsWith('surreal:product:')).toBe(true);
 		expect(options.persistence.coordinator.getNodeId()).toBe('test-node');
 	});
 

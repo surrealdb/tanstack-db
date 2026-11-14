@@ -1,4 +1,4 @@
-import { surrealCollectionOptions } from '../dist';
+import { surrealCollectionOptions } from '../src';
 
 import { RecordId, Surreal } from 'surrealdb';
 

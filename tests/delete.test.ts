@@ -35,7 +35,7 @@ describe('collection.delete RecordId normalization', () => {
 		expect(folders.has('folder:alpha')).toBe(true);
 
 		const tx = folders.delete(new RecordId('folder', 'alpha'));
-		await tx.isPersisted.promise;
+		await tx.when('settled');
 
 		expect(deleted).toEqual(['folder:alpha']);
 		expect(folders.has('folder:alpha')).toBe(false);
@@ -78,7 +78,7 @@ describe('collection.delete RecordId normalization', () => {
 		expect(folders.has('folder:alpha')).toBe(true);
 
 		const tx = folders.delete(new RecordId('folder', 'alpha'));
-		await tx.isPersisted.promise;
+		await tx.when('settled');
 
 		expect(deleted).toEqual(['folder:alpha']);
 		expect(folders.has('folder:alpha')).toBe(false);

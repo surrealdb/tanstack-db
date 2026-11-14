@@ -229,7 +229,7 @@ if (!integrationEnv) {
 		const syncResult = options.sync?.sync({
 			collection: {},
 			begin: () => {},
-			write: (change) => writes.push(change as SyncWrite),
+			write: (change: unknown) => writes.push(change as SyncWrite),
 			commit: () => {},
 			markReady: () => {
 				ready += 1;
@@ -305,7 +305,7 @@ if (!integrationEnv) {
 		const syncResult = options.sync?.sync({
 			collection: {},
 			begin: () => {},
-			write: (change) => writes.push(change as SyncWrite),
+			write: (change: unknown) => writes.push(change as SyncWrite),
 			commit: () => {},
 			markReady: () => {},
 			truncate: () => {},

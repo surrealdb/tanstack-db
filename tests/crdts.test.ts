@@ -44,15 +44,17 @@ describe('crdt profile helpers', () => {
 	});
 
 	it('returns profile-specific adapters', () => {
-		const json = createLoroProfile('json');
-		const rich = createLoroProfile('richtext');
+		const json = createLoroProfile<{ id: string; count: number }>('json');
+		const rich = createLoroProfile<{ id: string; content: string }>(
+			'richtext',
+		);
 
 		const jsonDoc = new LoroDoc();
 		json.applyLocalChange(jsonDoc, {
 			type: 'insert',
 			value: { id: '1', count: 1 },
 		});
-		expect(json.materialize<{ id: string; count: number }>(jsonDoc, '1').count).toBe(
+		expect(json.materialize(jsonDoc, '1').count).toBe(
 			1,
 		);
 
@@ -62,7 +64,7 @@ describe('crdt profile helpers', () => {
 			value: { id: '2', content: 'a' },
 		});
 		expect(
-			rich.materialize<{ id: string; content: string }>(richDoc, '2').content,
+			rich.materialize(richDoc, '2').content,
 		).toBe('a');
 	});
 });

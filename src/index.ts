@@ -3,11 +3,11 @@ import type {
 	CollectionConfig,
 	DeleteMutationFn,
 	DeleteMutationFnParams,
+	InferSchemaOutput,
 	InsertMutationFn,
 	InsertMutationFnParams,
 	LoadSubsetOptions,
 	OperationConfig,
-	StandardSchema,
 	SyncConfig,
 	Transaction,
 	UpdateMutationFn,
@@ -15,6 +15,7 @@ import type {
 	UtilsRecord,
 } from '@tanstack/db';
 import { persistedCollectionOptions } from '@tanstack/db-sqlite-persistence-core';
+import type { QueryFunctionContext } from '@tanstack/query-core';
 import { queryCollectionOptions } from '@tanstack/query-db-collection';
 import { LoroDoc } from 'loro-crdt';
 import { Features, RecordId } from 'surrealdb';
@@ -159,15 +160,27 @@ function modernSurrealCollectionOptions<T extends SyncedTable<object>>(
 	const defaultCrdtProfile = crdtEnabled
 		? createLoroProfile<T>(crdt.profile)
 		: undefined;
-	const materializeCrdt =
+	const crdtMaterialize =
 		crdt?.materialize ?? defaultCrdtProfile?.materialize;
-	const applyCrdtLocalChange =
+	const crdtApplyLocalChange =
 		crdt?.applyLocalChange ?? defaultCrdtProfile?.applyLocalChange;
-	if (crdtEnabled && (!materializeCrdt || !applyCrdtLocalChange)) {
-		throw new Error(
+	const missingCrdtHandlers = () =>
+		new Error(
 			'CRDT profile adapter is missing materialize/applyLocalChange handlers.',
 		);
+	if (crdtEnabled && (!crdtMaterialize || !crdtApplyLocalChange)) {
+		throw missingCrdtHandlers();
 	}
+	const materializeCrdt = (doc: LoroDoc, id: string): T => {
+		if (!crdtMaterialize) throw missingCrdtHandlers();
+		return crdtMaterialize(doc, id);
+	};
+	const applyCrdtLocalChange = (
+		...args: Parameters<NonNullable<typeof crdtApplyLocalChange>>
+	): void => {
+		if (!crdtApplyLocalChange) throw missingCrdtHandlers();
+		crdtApplyLocalChange(...args);
+	};
 
 	const tableAccess = manageTable<T>(db, tableOptions);
 	const docs = new Map<string, LoroDoc>();
@@ -558,10 +571,24 @@ function modernSurrealCollectionOptions<T extends SyncedTable<object>>(
 			);
 			activeSubsets.set(key, ids);
 
+			// Subsets overlap (e.g. an unfiltered query followed by a filtered one),
+			// so a row may already be synced. Re-inserting it is a duplicate-key error.
+			const upsertWrite: typeof ctx.write = (change) => {
+				if (
+					change.type === 'insert' &&
+					typeof ctx.collection?.has === 'function' &&
+					ctx.collection.has(getKey(change.value))
+				) {
+					ctx.write({ ...change, type: 'update' });
+					return;
+				}
+				ctx.write(change);
+			};
+
 			if (!crdtEnabled) {
 				await hydratePlainRows(
 					rows as unknown as Array<Record<string, unknown>>,
-					ctx.write,
+					upsertWrite,
 					ctx.begin,
 					ctx.commit,
 					'insert',
@@ -573,7 +600,7 @@ function modernSurrealCollectionOptions<T extends SyncedTable<object>>(
 			for (const id of ids) {
 				await hydrateCrdtDoc(
 					id,
-					ctx.write,
+					upsertWrite,
 					ctx.begin,
 					ctx.commit,
 					'insert',
@@ -623,7 +650,7 @@ function modernSurrealCollectionOptions<T extends SyncedTable<object>>(
 		queryKey,
 		queryClient,
 		syncMode: queryDrivenSyncMode,
-		queryFn: async ({ meta }) => {
+		queryFn: async ({ meta }: QueryFunctionContext) => {
 			try {
 				primeRecordIdIdentityFromSubset(meta?.loadSubsetOptions);
 
@@ -680,7 +707,6 @@ function modernSurrealCollectionOptions<T extends SyncedTable<object>>(
 			}
 		},
 		onInsert: (async (params: InsertMutationFnParams<T>) => {
-			const out: T[] = [];
 			const writeUtils = getWriteUtils(params.collection.utils);
 			for (const mutation of params.transaction.mutations) {
 				if (mutation.type !== 'insert') continue;
@@ -712,7 +738,6 @@ function modernSurrealCollectionOptions<T extends SyncedTable<object>>(
 							...normalized,
 							id: normalizeMutationId(createdId),
 						} as T;
-						out.push(resolved);
 						writeUtils.writeUpsert?.(resolved);
 						continue;
 					}
@@ -721,7 +746,6 @@ function modernSurrealCollectionOptions<T extends SyncedTable<object>>(
 						id: normalizeMutationId(normalized.id),
 						...recordPayload,
 					});
-					out.push(normalized);
 					writeUtils.writeUpsert?.(normalized);
 					continue;
 				}
@@ -738,12 +762,9 @@ function modernSurrealCollectionOptions<T extends SyncedTable<object>>(
 				await persistCrdtUpdate(id, bytes, localChange);
 				const materialized = normalizeRow(materializeCrdt(doc, id));
 				await persistMaterialized(materialized);
-				out.push(materialized);
 				writeUtils.writeUpsert?.(materialized);
 			}
-
-			return out as unknown as StandardSchema<T>;
-		}) as InsertMutationFn<T, string, UtilsRecord, StandardSchema<T>>,
+		}) as InsertMutationFn<T, string, UtilsRecord>,
 		onUpdate: (async (params: UpdateMutationFnParams<T>) => {
 			const writeUtils = getWriteUtils(params.collection.utils);
 			for (const mutation of params.transaction.mutations) {
@@ -808,8 +829,7 @@ function modernSurrealCollectionOptions<T extends SyncedTable<object>>(
 				await persistMaterialized(materialized);
 				writeUtils.writeUpsert?.(materialized);
 			}
-			return { refetch: false } as unknown as StandardSchema<T>;
-		}) as UpdateMutationFn<T, string, UtilsRecord, StandardSchema<T>>,
+		}) as UpdateMutationFn<T, string, UtilsRecord>,
 		onDelete: (async (params: DeleteMutationFnParams<T>) => {
 			const writeUtils = getWriteUtils(params.collection.utils);
 			for (const mutation of params.transaction.mutations) {
@@ -835,8 +855,7 @@ function modernSurrealCollectionOptions<T extends SyncedTable<object>>(
 				await persistCrdtUpdate(id, bytes, localChange);
 				writeUtils.writeDelete?.(`${tableName}:${id}`);
 			}
-			return { refetch: false } as unknown as StandardSchema<T>;
-		}) as DeleteMutationFn<T, string, UtilsRecord, StandardSchema<T>>,
+		}) as DeleteMutationFn<T, string, UtilsRecord>,
 	} as never) as unknown as SurrealCollectionOptionsReturn<T>;
 
 	const baseSync = base.sync?.sync;
@@ -939,10 +958,10 @@ function modernSurrealCollectionOptions<T extends SyncedTable<object>>(
 							runtime.cleanup();
 							baseCleanup();
 						},
-						loadSubset: async (subset) => {
+						loadSubset: async (subset: LoadSubsetOptions) => {
 							await runtime.loadSubset(subset);
 						},
-						unloadSubset: (subset) => {
+						unloadSubset: (subset: LoadSubsetOptions) => {
 							runtime.unloadSubset(subset);
 						},
 					};
@@ -975,15 +994,22 @@ export function persistedSurrealCollectionOptions<
 >(config: PersistedSurrealCollectionOptions<T>) {
 	const { persistence, schemaVersion, ...surrealConfig } = config;
 
-	return persistedCollectionOptions<
-		T,
+	type Schema = StandardSchemaV1<Omit<T, 'id'> & { id?: T['id'] }, T>;
+	// InferSchemaOutput<Schema> is T at runtime, but TypeScript can't resolve the
+	// conditional type for a generic T, so the options are viewed through it once here.
+	const options = modernSurrealCollectionOptions(
+		surrealConfig,
+	) as unknown as CollectionConfig<
+		InferSchemaOutput<Schema>,
 		string,
-		StandardSchemaV1<Omit<T, 'id'> & { id?: T['id'] }, T>,
+		Schema,
 		UtilsRecord
-	>({
+	> & { schema: Schema; utils: UtilsRecord };
+
+	return persistedCollectionOptions<Schema, string, UtilsRecord>({
 		persistence,
 		schemaVersion,
-		...modernSurrealCollectionOptions(surrealConfig),
+		...options,
 	});
 }
 
