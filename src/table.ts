@@ -1,5 +1,6 @@
 import { parseOrderByExpression, parseWhereExpression } from '@tanstack/db';
 import {
+	type Expr,
 	Features,
 	type LiveMessage,
 	type LiveSubscription,
@@ -97,25 +98,35 @@ const joinLogical = (op: 'AND' | 'OR', args: Array<unknown>): SqlFragment => {
 	};
 };
 
-const buildSubsetQuery = (
+type BindParam = (value: unknown) => string;
+
+type WhereExpression = NonNullable<SurrealSubset['where']>;
+
+export type SubsetOrder = {
+	field: FieldPath;
+	direction: 'asc' | 'desc';
+};
+
+export type WindowBoundary = SubsetOrder & { value: unknown };
+
+const whereSqlFrom = (
 	table: TableOptions,
-	subset?: SurrealSubset,
-): { sql: string; params: Record<string, unknown> } => {
-	let paramIdx = 0;
-	const params: Record<string, unknown> = { table: table.name };
-	const nextParam = (value: unknown): string => {
-		const key = `p${paramIdx++}`;
-		params[key] = value;
-		return `$${key}`;
+	expr: WhereExpression,
+	bind: BindParam,
+	scope?: string,
+): string => {
+	const fieldSql = (fieldPath: unknown): string => {
+		const field = formatFieldPath(
+			mapRelationPath(toFieldPath(fieldPath), table.relation),
+		);
+		return scope ? `${scope}.${field}` : field;
 	};
 	const comparison = (
 		fieldPath: unknown,
 		op: '=' | '!=' | '>' | '>=' | '<' | '<=' | 'LIKE',
 		value: unknown,
 	): SqlFragment => {
-		const field = formatFieldPath(
-			mapRelationPath(toFieldPath(fieldPath), table.relation),
-		);
+		const field = fieldSql(fieldPath);
 
 		if (value === undefined) {
 			if (op === '=') return { sql: `${field} IS NONE` };
@@ -131,87 +142,148 @@ const buildSubsetQuery = (
 			);
 		}
 		return {
-			sql: `${field} ${op} ${nextParam(normalizeFilterValue(value))}`,
+			sql: `${field} ${op} ${bind(normalizeFilterValue(value))}`,
 		};
 	};
-	const whereSqlFrom = (
-		expr: NonNullable<SurrealSubset['where']>,
-	): string => {
-		const fragment = parseWhereExpression<SqlFragment>(expr, {
-			handlers: {
-				and: (...args) => joinLogical('AND', args),
-				or: (...args) => joinLogical('OR', args),
-				not: (arg) => ({ sql: `NOT (${toSqlFragment(arg).sql})` }),
-				eq: (field, value) => comparison(field, '=', value),
-				gt: (field, value) => comparison(field, '>', value),
-				gte: (field, value) => comparison(field, '>=', value),
-				lt: (field, value) => comparison(field, '<', value),
-				lte: (field, value) => comparison(field, '<=', value),
-				like: (field, value) => comparison(field, 'LIKE', value),
-				ilike: (field, value) => {
-					const f = formatFieldPath(
-						mapRelationPath(toFieldPath(field), table.relation),
-					);
-					const p = nextParam(normalizeFilterValue(value));
-					return {
-						sql: `string::lower(${f}) LIKE string::lower(${p})`,
-					};
-				},
-				in: (field, value) => {
-					const f = formatFieldPath(
-						mapRelationPath(toFieldPath(field), table.relation),
-					);
-					if (Array.isArray(value) && value.length === 0) {
-						return { sql: 'false' };
-					}
-					return {
-						sql: `${f} IN ${nextParam(normalizeFilterValue(value))}`,
-					};
-				},
-				isNull: (field) => ({
-					sql: `${formatFieldPath(
-						mapRelationPath(toFieldPath(field), table.relation),
-					)} IS NULL`,
-				}),
-				isUndefined: (field) => ({
-					sql: `${formatFieldPath(
-						mapRelationPath(toFieldPath(field), table.relation),
-					)} IS NONE`,
-				}),
-			},
-			onUnknownOperator: (op) => {
-				throw new Error(
-					`Unsupported where operator '${op}' for SurrealQL translation.`,
-				);
-			},
-		});
 
-		if (!fragment) return '';
-		return fragment.sql;
+	const fragment = parseWhereExpression<SqlFragment>(expr, {
+		handlers: {
+			and: (...args) => joinLogical('AND', args),
+			or: (...args) => joinLogical('OR', args),
+			not: (arg) => ({ sql: `NOT (${toSqlFragment(arg).sql})` }),
+			eq: (field, value) => comparison(field, '=', value),
+			gt: (field, value) => comparison(field, '>', value),
+			gte: (field, value) => comparison(field, '>=', value),
+			lt: (field, value) => comparison(field, '<', value),
+			lte: (field, value) => comparison(field, '<=', value),
+			like: (field, value) => comparison(field, 'LIKE', value),
+			ilike: (field, value) => {
+				const f = fieldSql(field);
+				const p = bind(normalizeFilterValue(value));
+				return {
+					sql: `string::lower(${f}) LIKE string::lower(${p})`,
+				};
+			},
+			in: (field, value) => {
+				const f = fieldSql(field);
+				if (Array.isArray(value) && value.length === 0) {
+					return { sql: 'false' };
+				}
+				return {
+					sql: `${f} IN ${bind(normalizeFilterValue(value))}`,
+				};
+			},
+			isNull: (field) => ({ sql: `${fieldSql(field)} IS NULL` }),
+			isUndefined: (field) => ({ sql: `${fieldSql(field)} IS NONE` }),
+		},
+		onUnknownOperator: (op) => {
+			throw new Error(
+				`Unsupported where operator '${op}' for SurrealQL translation.`,
+			);
+		},
+	});
+
+	if (!fragment) return '';
+	return fragment.sql;
+};
+
+const subsetFilters = (subset?: SurrealSubset): WhereExpression[] =>
+	[subset?.where, subset?.cursor?.whereFrom].filter(
+		(expr): expr is WhereExpression => Boolean(expr),
+	);
+
+const filterSqlFrom = (
+	table: TableOptions,
+	subset: SurrealSubset | undefined,
+	bind: BindParam,
+	scope?: string,
+): string[] =>
+	subsetFilters(subset)
+		.map((expr) => whereSqlFrom(table, expr, bind, scope))
+		.filter(Boolean);
+
+const isOrdered = (subset?: SurrealSubset): boolean =>
+	Boolean(subset?.orderBy?.length) ||
+	typeof subset?.limit === 'number' ||
+	typeof subset?.offset === 'number';
+
+export const subsetOrderOf = (
+	table: TableOptions,
+	subset?: SurrealSubset,
+): SubsetOrder[] => {
+	if (!isOrdered(subset)) return [];
+	const order: SubsetOrder[] = parseOrderByExpression(subset?.orderBy).map(
+		(clause) => ({
+			field: mapRelationPath(clause.field, table.relation),
+			direction: clause.direction,
+		}),
+	);
+	const hasId = order.some(
+		(clause) => clause.field.length === 1 && clause.field[0] === 'id',
+	);
+	if (!hasId) order.push({ field: ['id'], direction: 'asc' });
+	return order;
+};
+
+const readFieldPath = (row: unknown, path: FieldPath): unknown => {
+	let value = row;
+	for (const segment of path) {
+		if (value === null || typeof value !== 'object') return undefined;
+		value = (value as Record<string | number, unknown>)[segment];
+	}
+	return value;
+};
+
+export const windowBoundaryOf = (
+	table: TableOptions,
+	subset: SurrealSubset | undefined,
+	rows: ReadonlyArray<unknown>,
+): WindowBoundary | undefined => {
+	const limit = subset?.limit;
+	if (typeof limit !== 'number' || rows.length === 0) return undefined;
+	if (rows.length < limit) return undefined;
+	const leading = subsetOrderOf(table, subset)[0];
+	if (!leading) return undefined;
+	const value = readFieldPath(rows[rows.length - 1], leading.field);
+	if (value === undefined || value === null) return undefined;
+	return { ...leading, value };
+};
+
+const boundarySql = (
+	boundary: WindowBoundary,
+	bind: BindParam,
+	scope?: string,
+): string => {
+	const path = formatFieldPath(boundary.field);
+	const field = scope ? `${scope}.${path}` : path;
+	const op = boundary.direction === 'desc' ? '>=' : '<=';
+	const value = bind(normalizeFilterValue(boundary.value));
+	return `${field} ${op} ${value} OR ${field} IS NONE OR ${field} IS NULL`;
+};
+
+export const buildSubsetQuery = (
+	table: TableOptions,
+	subset?: SurrealSubset,
+): { sql: string; params: Record<string, unknown> } => {
+	let paramIdx = 0;
+	const params: Record<string, unknown> = { table: table.name };
+	const nextParam: BindParam = (value) => {
+		const key = `p${paramIdx++}`;
+		params[key] = value;
+		return `$${key}`;
 	};
 
-	const whereParts: string[] = [];
-	if (subset?.where) {
-		const parsed = whereSqlFrom(subset.where);
-		if (parsed) whereParts.push(parsed);
-	}
-	if (subset?.cursor?.whereFrom) {
-		const cursorWhere = whereSqlFrom(subset.cursor.whereFrom);
-		if (cursorWhere) whereParts.push(cursorWhere);
-	}
-
+	const whereParts = filterSqlFrom(table, subset, nextParam);
 	const whereSql = whereParts.length
 		? ` WHERE ${whereParts.map((part) => `(${part})`).join(' AND ')}`
 		: '';
 
-	const order = parseOrderByExpression(subset?.orderBy);
+	const order = subsetOrderOf(table, subset);
 	const orderSql = order.length
 		? ` ORDER BY ${order
 				.map(
 					(clause) =>
-						`${formatFieldPath(
-							mapRelationPath(clause.field, table.relation),
-						)} ${clause.direction.toUpperCase()}`,
+						`${formatFieldPath(clause.field)} ${clause.direction.toUpperCase()}`,
 				)
 				.join(', ')}`
 		: '';
@@ -227,6 +299,29 @@ const buildSubsetQuery = (
 	return {
 		sql: `SELECT * FROM type::table($table)${whereSql}${orderSql}${limitSql}${offsetSql};`,
 		params,
+	};
+};
+
+export const buildLiveCondition = (
+	table: TableOptions,
+	subset?: SurrealSubset,
+	boundary?: WindowBoundary,
+): Expr | undefined => {
+	const scoped = (bind: BindParam, scope?: string): string[] => {
+		const parts = filterSqlFrom(table, subset, bind, scope);
+		if (boundary) parts.push(boundarySql(boundary, bind, scope));
+		return parts;
+	};
+	if (!subsetFilters(subset).length && !boundary) return undefined;
+
+	const conjunction = (parts: string[]): string =>
+		parts.map((part) => `(${part})`).join(' AND ');
+
+	return {
+		toSQL: (ctx) =>
+			`(${conjunction(scoped(ctx.def))}) OR ($before IS NOT NONE AND ${conjunction(
+				scoped(ctx.def, '$before'),
+			)})`,
 	};
 };
 

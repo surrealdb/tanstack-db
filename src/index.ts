@@ -37,6 +37,7 @@ import {
 	toEnvelope,
 	toStoredEnvelope,
 } from './internal/envelope';
+import { createLiveSubsets } from './internal/live-subsets';
 import {
 	firstRow,
 	omitUndefined,
@@ -471,17 +472,7 @@ function modernSurrealCollectionOptions<T extends SyncedTable<object>>(
 				const row = message.value as Record<string, unknown>;
 				const id = toRecordKeyString(row.id as string | RecordId);
 
-				const wasVisible = activeSubsets.has(id);
-				if (
-					isStrictOnDemand &&
-					!wasVisible &&
-					message.action !== 'DELETE'
-				)
-					return;
-
 				if (message.action === 'DELETE') {
-					activeSubsets.deleteId(id);
-					if (isStrictOnDemand && !wasVisible) return;
 					ctx.begin();
 					try {
 						ctx.write({
@@ -554,6 +545,67 @@ function modernSurrealCollectionOptions<T extends SyncedTable<object>>(
 			};
 		};
 
+		const collectionHas = (key: string): boolean | undefined =>
+			typeof ctx.collection?.has === 'function'
+				? ctx.collection.has(key)
+				: undefined;
+
+		const liveSubsets =
+			isOnDemandLike && !crdtEnabled
+				? createLiveSubsets<T>({
+						db,
+						table: tableOptions,
+						tracker: activeSubsets,
+						onError,
+						loadRows: (subset) =>
+							tableAccess.loadSubset(
+								subset,
+							) as unknown as Promise<
+								Array<Record<string, unknown>>
+							>,
+						decode: decodeBaseRow,
+						writeRows: async (rows) => {
+							if (!rows.length) return;
+							ctx.begin();
+							let receipt: unknown;
+							try {
+								for (const row of rows) {
+									ctx.write({
+										type: collectionHas(getKey(row))
+											? 'update'
+											: 'insert',
+										value: row,
+									});
+								}
+							} finally {
+								receipt = ctx.commit();
+							}
+							await receipt;
+						},
+						evict: async (ids) => {
+							const keys = ids
+								.map((id) => `${tableName}:${id}`)
+								.filter((key) => collectionHas(key) !== false);
+							if (!keys.length) return;
+							ctx.begin();
+							let receipt: unknown;
+							try {
+								for (const key of keys) {
+									ctx.write({ type: 'delete', key });
+								}
+							} finally {
+								receipt = ctx.commit();
+							}
+							await receipt;
+						},
+						invalidate: () => {
+							(
+								ctx as { invalidateLoadedSubsets?: () => void }
+							).invalidateLoadedSubsets?.();
+						},
+					})
+				: undefined;
+
 		const loadSubset = async (subset: LoadSubsetOptions) => {
 			if (!queryDrivenUsesSubsets) return;
 			const preferredFromSubset = primeRecordIdIdentityFromSubset(subset);
@@ -562,6 +614,10 @@ function modernSurrealCollectionOptions<T extends SyncedTable<object>>(
 				ctx,
 				preferredFromSubset,
 			);
+			if (liveSubsets) {
+				await liveSubsets.load(subset);
+				return;
+			}
 			const key = subsetCacheKey(subset);
 			const rows = await tableAccess.loadSubset(subset);
 			const ids = new Set(
@@ -612,6 +668,10 @@ function modernSurrealCollectionOptions<T extends SyncedTable<object>>(
 		const unloadSubset = (subset: LoadSubsetOptions) => {
 			if (!queryDrivenUsesSubsets) return;
 			primeRecordIdIdentityFromSubset(subset);
+			if (liveSubsets) {
+				liveSubsets.unload(subset);
+				return;
+			}
 			const key = subsetCacheKey(subset);
 			activeSubsets.delete(key);
 			if (activeSubsets.size === 0) {
@@ -630,6 +690,7 @@ function modernSurrealCollectionOptions<T extends SyncedTable<object>>(
 
 		const cleanup = () => {
 			killed = true;
+			liveSubsets?.cleanup();
 			activeSubsets.clear();
 			cleanupBaseLive();
 			cleanupUpdateLive();

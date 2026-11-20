@@ -10,8 +10,15 @@ import { isPlainObject } from './records';
 
 export const subsetCacheKey = (subset: LoadSubsetOptions): string => {
 	const seen = new WeakSet<object>();
+	const demand = {
+		where: subset.where,
+		orderBy: subset.orderBy,
+		limit: subset.limit,
+		offset: subset.offset,
+		cursor: subset.cursor,
+	};
 	return (
-		JSON.stringify(subset, (_key, value) => {
+		JSON.stringify(demand, (_key, value) => {
 			if (value instanceof Date) return value.toISOString();
 			if (value instanceof RecordId) return toRecordIdString(value);
 			if (typeof value === 'bigint') return value.toString();

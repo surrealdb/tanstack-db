@@ -3,7 +3,7 @@ import { createCollection, createLiveQueryCollection, eq } from '@tanstack/db';
 import { QueryClient } from '@tanstack/query-core';
 import { Features, RecordId, Surreal, Table } from 'surrealdb';
 
-import { toRecordKeyString } from '../src/id';
+import { toRecordIdString, toRecordKeyString } from '../src/id';
 import { surrealCollectionOptions } from '../src/index';
 import { manageTable } from '../src/table';
 
@@ -117,6 +117,77 @@ const ensureTableSchema = async (db: Surreal, tableName: string) => {
 const dropTable = async (db: Surreal, tableName: string) => {
 	const safe = assertSafeIdentifier(tableName);
 	await db.query(`REMOVE TABLE ${safe};`);
+};
+
+const requireLiveQueries = (db: Surreal) => {
+	if (
+		integrationEnv?.requireLive &&
+		!db.isFeatureSupported(Features.LiveQueries)
+	) {
+		throw new Error(
+			'LiveQueries are not supported by this Surreal connection. Use a ws:// or wss:// SURREAL_URL, or set SURREAL_REQUIRE_LIVE=false.',
+		);
+	}
+};
+
+const ref = (field: string) => ({ type: 'ref', path: [field] }) as const;
+const val = (value: unknown) => ({ type: 'val', value }) as const;
+const fn = (name: string, ...args: unknown[]) =>
+	({ type: 'func', name, args }) as never;
+const asc = (field: string) =>
+	({
+		expression: ref(field),
+		compareOptions: { direction: 'asc', nulls: 'first' },
+	}) as never;
+
+type HeldRow = Record<string, unknown> & { id: RecordId | string };
+type SubsetSync = {
+	loadSubset: (subset: object) => Promise<void>;
+	unloadSubset: (subset: object) => void;
+};
+
+const startOnDemandSync = (db: Surreal, tableName: string, label: string) => {
+	const options = surrealCollectionOptions<HeldRow>({
+		db,
+		table: { name: tableName },
+		queryClient: new QueryClient(),
+		queryKey: [tableName, label],
+		syncMode: 'on-demand',
+	});
+	const rows = new Map<string, Record<string, unknown>>();
+	const writes: SyncWrite[] = [];
+	const result = options.sync?.sync({
+		collection: { has: (key: string) => rows.has(key) },
+		begin: () => {},
+		write: (change: unknown) => {
+			const write = change as SyncWrite;
+			writes.push(write);
+			if (write.type === 'delete') {
+				rows.delete(
+					write.key ??
+						toRecordIdString(write.value?.id as RecordId | string),
+				);
+				return;
+			}
+			const value = write.value as Record<string, unknown>;
+			rows.set(toRecordIdString(value.id as RecordId | string), value);
+		},
+		commit: () => true,
+		markReady: () => {},
+		truncate: () => {},
+		invalidateLoadedSubsets: () => {},
+	} as never);
+	const subsets = result as unknown as SubsetSync;
+
+	return {
+		writes,
+		loadSubset: (subset: object) => subsets.loadSubset(subset),
+		unloadSubset: (subset: object) => subsets.unloadSubset(subset),
+		has: (id: string) => rows.has(`${tableName}:${id}`),
+		row: (id: string) => rows.get(`${tableName}:${id}`),
+		keys: () => [...rows.keys()].sort(),
+		cleanup: () => cleanupSyncResult(result),
+	};
 };
 
 if (!integrationEnv) {
@@ -275,85 +346,225 @@ if (!integrationEnv) {
 		cleanupSyncResult(syncResult);
 	});
 
-	it('applies on-demand replication only for active ids', async () => {
-		const env = integrationEnv;
-		if (env.requireLive && !db.isFeatureSupported(Features.LiveQueries)) {
-			throw new Error(
-				'LiveQueries are not supported by this Surreal connection. Use a ws:// or wss:// SURREAL_URL, or set SURREAL_REQUIRE_LIVE=false.',
-			);
-		}
-
-		const tableName = createTableName('it_on_demand');
+	it('streams rows entering, changing and leaving a filtered on-demand subset', async () => {
+		requireLiveQueries(db);
+		const tableName = createTableName('it_subset_filter');
 		createdTables.add(tableName);
-		const activeId = new RecordId(tableName, 'one');
-		const inactiveId = new RecordId(tableName, 'two');
-
 		await ensureTableSchema(db, tableName);
-		await db.query('DELETE type::table($table);', { table: tableName });
-		await db.insert(new Table(tableName), { id: activeId, title: 'One' });
+		const rid = (id: string) => new RecordId(tableName, id);
+		await db.insert(new Table(tableName), [
+			{ id: rid('one'), title: 'One', category: 'books' },
+			{ id: rid('two'), title: 'Two', category: 'games' },
+		]);
 
-		type Task = { id: string | RecordId; title: string };
-		const options = surrealCollectionOptions<Task>({
-			db,
-			table: { name: tableName },
-			queryClient: new QueryClient(),
-			queryKey: [tableName, 'on-demand'],
-			syncMode: 'on-demand',
+		const sync = startOnDemandSync(db, tableName, 'filter');
+		await sync.loadSubset({ where: fn('eq', ref('category'), val('books')) });
+		expect(sync.keys()).toEqual([`${tableName}:one`]);
+
+		await db.insert(new Table(tableName), {
+			id: rid('three'),
+			title: 'Three',
+			category: 'games',
 		});
-
-		const writes: SyncWrite[] = [];
-		const syncResult = options.sync?.sync({
-			collection: {},
-			begin: () => {},
-			write: (change: unknown) => writes.push(change as SyncWrite),
-			commit: () => {},
-			markReady: () => {},
-			truncate: () => {},
-		} as never);
-
-		if (
-			!syncResult ||
-			typeof syncResult !== 'object' ||
-			!('loadSubset' in syncResult) ||
-			typeof (syncResult as { loadSubset?: unknown }).loadSubset !== 'function'
-		) {
-			throw new Error('Expected on-demand sync result to expose loadSubset().');
-		}
-
-		await (syncResult as { loadSubset: (subset: object) => Promise<void> }).loadSubset(
-			{},
-		);
-
-		await waitFor(
-			() =>
-				writes.some(
-					(change) =>
-						(change.value as { title?: string } | undefined)?.title === 'One',
-				),
-			'initial on-demand subset hydration',
-		);
-
-		await db.insert(new Table(tableName), { id: inactiveId, title: 'Two' });
 		await sleep(400);
-		expect(
-			writes.some(
-				(change) =>
-					(change.value as { title?: string } | undefined)?.title === 'Two',
-			),
-		).toBe(false);
+		expect(sync.has('three')).toBe(false);
 
-		await db.update(activeId).merge({ title: 'One Updated' });
-		await waitFor(
-			() =>
-				writes.some(
-					(change) =>
-						(change.value as { title?: string } | undefined)?.title ===
-						'One Updated',
-				),
-			'live UPDATE for active id in on-demand mode',
+		await db.insert(new Table(tableName), {
+			id: rid('four'),
+			title: 'Four',
+			category: 'books',
+		});
+		await waitFor(() => sync.has('four'), 'a new matching row to stream in');
+
+		await db.update(rid('two')).merge({ category: 'books' });
+		await waitFor(() => sync.has('two'), 'a row entering the filter');
+
+		await db.update(rid('one')).merge({ category: 'games' });
+		await waitFor(() => !sync.has('one'), 'a row leaving the filter');
+
+		await db.delete(rid('four'));
+		await waitFor(() => !sync.has('four'), 'a deleted row to go');
+
+		sync.cleanup();
+	});
+
+	it('streams only changes inside the window of an ordered, limited subset', async () => {
+		requireLiveQueries(db);
+		const tableName = createTableName('it_subset_window');
+		createdTables.add(tableName);
+		await ensureTableSchema(db, tableName);
+		const rid = (id: string) => new RecordId(tableName, id);
+		await db.insert(
+			new Table(tableName),
+			['a', 'b', 'c', 'd', 'e'].map((name) => ({
+				id: rid(name),
+				name,
+				title: name.toUpperCase(),
+			})),
 		);
 
-		cleanupSyncResult(syncResult);
+		const sync = startOnDemandSync(db, tableName, 'window');
+		await sync.loadSubset({ orderBy: [asc('name')], limit: 2 });
+		expect(sync.keys()).toEqual([`${tableName}:a`, `${tableName}:b`]);
+
+		const before = sync.writes.length;
+		await db.update(rid('e')).merge({ title: 'E2' });
+		await db.insert(new Table(tableName), { id: rid('z'), name: 'z' });
+		await sleep(400);
+		expect(sync.writes.length).toBe(before);
+
+		await db.insert(new Table(tableName), { id: rid('aa'), name: 'aa' });
+		await waitFor(() => sync.has('aa'), 'a row sorting into the window');
+
+		await db.update(rid('a')).merge({ title: 'A2' });
+		await waitFor(
+			() => sync.row('a')?.title === 'A2',
+			'an update inside the window',
+		);
+
+		await db.delete(rid('b'));
+		await waitFor(() => !sync.has('b'), 'a delete inside the window');
+
+		sync.cleanup();
+	});
+
+	it('sorts a limited subset by id when no order is given', async () => {
+		const tableName = createTableName('it_subset_default_sort');
+		createdTables.add(tableName);
+		await ensureTableSchema(db, tableName);
+		await db.insert(
+			new Table(tableName),
+			['d', 'b', 'e', 'a', 'c'].map((name) => ({
+				id: new RecordId(tableName, name),
+				name,
+			})),
+		);
+
+		const table = manageTable<{ id: RecordId; name: string }>(db, {
+			name: tableName,
+		});
+		const first = await table.loadSubset({ limit: 2 });
+		const second = await table.loadSubset({ limit: 2, offset: 2 });
+		expect(
+			[...first, ...second].map((row) => toRecordKeyString(row.id)),
+		).toEqual(['a', 'b', 'c', 'd']);
+	});
+
+	it('keeps rows matched by a RecordId filter when their other fields change', async () => {
+		requireLiveQueries(db);
+		const tableName = createTableName('it_subset_owner');
+		createdTables.add(tableName);
+		await ensureTableSchema(db, tableName);
+		const rid = (id: string) => new RecordId(tableName, id);
+		const owner = new RecordId('account', 'subset-owner');
+		await db.insert(new Table(tableName), [
+			{ id: rid('mine'), title: 'Mine', owner },
+			{
+				id: rid('theirs'),
+				title: 'Theirs',
+				owner: new RecordId('account', 'someone-else'),
+			},
+		]);
+
+		const sync = startOnDemandSync(db, tableName, 'owner');
+		await sync.loadSubset({
+			where: fn('eq', ref('owner'), val(new RecordId('account', 'subset-owner'))),
+		});
+		expect(sync.keys()).toEqual([`${tableName}:mine`]);
+
+		await db.update(rid('mine')).merge({ title: 'Mine v2' });
+		await waitFor(
+			() => sync.row('mine')?.title === 'Mine v2',
+			'an update to an owned row',
+		);
+		expect(sync.has('mine')).toBe(true);
+
+		sync.cleanup();
+	});
+
+	it('evicts rows and stops streaming when a subset unloads', async () => {
+		requireLiveQueries(db);
+		const tableName = createTableName('it_subset_unload');
+		createdTables.add(tableName);
+		await ensureTableSchema(db, tableName);
+		const rid = (id: string) => new RecordId(tableName, id);
+		await db.insert(new Table(tableName), [
+			{ id: rid('one'), title: 'One', category: 'books' },
+			{ id: rid('two'), title: 'Two', category: 'games' },
+		]);
+
+		const sync = startOnDemandSync(db, tableName, 'unload');
+		const books = { where: fn('eq', ref('category'), val('books')) };
+		const games = { where: fn('eq', ref('category'), val('games')) };
+		await sync.loadSubset(books);
+		await sync.loadSubset(games);
+		expect(sync.keys().sort()).toEqual([
+			`${tableName}:one`,
+			`${tableName}:two`,
+		]);
+
+		sync.unloadSubset(books);
+		await waitFor(() => !sync.has('one'), 'rows only the unloaded subset held');
+		expect(sync.has('two')).toBe(true);
+
+		await db.insert(new Table(tableName), {
+			id: rid('three'),
+			title: 'Three',
+			category: 'books',
+		});
+		await sleep(400);
+		expect(sync.has('three')).toBe(false);
+
+		sync.cleanup();
+	});
+
+	it('keeps an ordered live query window full as rows change', async () => {
+		requireLiveQueries(db);
+		const tableName = createTableName('it_window_e2e');
+		createdTables.add(tableName);
+		await ensureTableSchema(db, tableName);
+		const rid = (id: string) => new RecordId(tableName, id);
+		await db.insert(
+			new Table(tableName),
+			['b', 'c', 'd', 'e'].map((name) => ({ id: rid(name), name })),
+		);
+
+		type Item = { id: RecordId; name: string };
+		const items = createCollection(
+			surrealCollectionOptions<Item>({
+				db,
+				table: { name: tableName },
+				queryClient: new QueryClient(),
+				queryKey: [tableName, 'window-e2e'],
+				syncMode: 'on-demand',
+			}),
+		);
+		const topTwo = createLiveQueryCollection((query) =>
+			query
+				.from({ item: items })
+				.orderBy(({ item }) => item.name, 'asc')
+				.limit(2),
+		);
+		const names = () => topTwo.toArray.map((row) => row.name);
+
+		await topTwo.preload();
+		expect(names()).toEqual(['b', 'c']);
+
+		await db.insert(new Table(tableName), { id: rid('a'), name: 'a' });
+		await waitFor(
+			() => names().join() === 'a,b',
+			'a new first row to enter the window',
+		);
+
+		await db.delete(rid('a'));
+		await db.delete(rid('b'));
+		await waitFor(
+			() => names().join() === 'c,d',
+			'the window to refill after deletes',
+		);
+
+		await topTwo.cleanup();
+		await items.cleanup();
 	});
 
 	it('filters rows by RecordId in WHERE (native + cross-runtime)', async () => {
