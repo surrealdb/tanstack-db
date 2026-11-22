@@ -4,7 +4,7 @@ import type {
 	LoadSubsetOptions,
 	UtilsRecord,
 } from '@tanstack/db';
-import type { PersistedCollectionPersistence } from '@tanstack/db-sqlite-persistence-core';
+import type { PersistedSyncWrappedOptions } from '@tanstack/db-sqlite-persistence-core';
 import type { QueryClient } from '@tanstack/query-core';
 import type { LoroDoc } from 'loro-crdt';
 import type { RecordId, Surreal, Table } from 'surrealdb';
@@ -79,9 +79,37 @@ export type SurrealCRDTOptions<T extends object> = {
 
 export type AdapterSyncMode = 'eager' | 'on-demand' | 'progressive';
 
-export type SurrealCollectionOptions<T extends object> = Omit<
-	CollectionConfig<T>,
-	'onInsert' | 'onUpdate' | 'onDelete' | 'sync' | 'getKey' | 'syncMode'
+/**
+ * Standard TanStack DB collection options the adapter passes through unchanged.
+ * `gcTime` goes to `queryCollectionOptions`, which uses it as the query `gcTime`.
+ */
+export type ForwardedCollectionOptionKey =
+	| 'gcTime'
+	| 'startSync'
+	| 'autoIndex'
+	| 'defaultIndexType'
+	| 'compare'
+	| 'defaultStringCollation';
+
+/**
+ * Standard TanStack DB collection options the adapter sets itself: the key,
+ * insert schema, sync, mutation handlers and query utils are what make it a
+ * Surreal collection. `id` and `syncMode` have their own adapter options.
+ */
+export type AdapterOwnedCollectionOptionKey =
+	| 'id'
+	| 'schema'
+	| 'getKey'
+	| 'sync'
+	| 'syncMode'
+	| 'onInsert'
+	| 'onUpdate'
+	| 'onDelete'
+	| 'utils';
+
+export type SurrealCollectionOptions<T extends object> = Pick<
+	CollectionConfig<T, string>,
+	ForwardedCollectionOptionKey
 > & {
 	/**
 	 * Optional stable collection identity.
@@ -99,11 +127,18 @@ export type SurrealCollectionOptions<T extends object> = Omit<
 	onError?: (error: unknown) => void;
 };
 
+/**
+ * Options that only `persistedCollectionOptions` understands (`persistence`,
+ * `schemaVersion`, `initialRender`, ...), derived from its input type so new
+ * persisted options are picked up automatically.
+ */
+export type PersistedOnlyCollectionOptions = Omit<
+	PersistedSyncWrappedOptions<object, string>,
+	keyof CollectionConfig<object, string> | 'sync'
+>;
+
 export type PersistedSurrealCollectionOptions<T extends object> =
-	SurrealCollectionOptions<T> & {
-		persistence: PersistedCollectionPersistence;
-		schemaVersion?: number;
-	};
+	SurrealCollectionOptions<T> & PersistedOnlyCollectionOptions;
 
 export type SurrealCollectionOptionsReturn<
 	T extends { id: string | RecordId },

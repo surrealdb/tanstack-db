@@ -62,8 +62,11 @@ import {
 import { manageTable } from './table';
 import type {
 	AADContext,
+	AdapterOwnedCollectionOptionKey,
 	AdapterSyncMode,
+	ForwardedCollectionOptionKey,
 	LocalChange,
+	PersistedOnlyCollectionOptions,
 	PersistedSurrealCollectionOptions,
 	SurrealCollectionOptions,
 	SurrealCollectionOptionsReturn,
@@ -123,6 +126,41 @@ type BaseSyncRuntime = {
 	loadSubset: (subset: LoadSubsetOptions) => Promise<void>;
 	unloadSubset: (subset: LoadSubsetOptions) => void;
 };
+
+// Every standard collection option is either forwarded or owned by the adapter.
+// The type checks below fail if TanStack DB gains an option that is in neither
+// list, or if this array misses a forwarded key, so options aren't silently dropped.
+const FORWARDED_COLLECTION_OPTION_KEYS = [
+	'gcTime',
+	'startSync',
+	'autoIndex',
+	'defaultIndexType',
+	'compare',
+	'defaultStringCollation',
+] as const satisfies ReadonlyArray<ForwardedCollectionOptionKey>;
+type AssertNever<T extends never> = T;
+type _AllForwardedCollectionOptionKeysListed = AssertNever<
+	Exclude<
+		ForwardedCollectionOptionKey,
+		(typeof FORWARDED_COLLECTION_OPTION_KEYS)[number]
+	>
+>;
+type _AllCollectionOptionKeysClassified = AssertNever<
+	Exclude<
+		keyof CollectionConfig<object, string>,
+		ForwardedCollectionOptionKey | AdapterOwnedCollectionOptionKey
+	>
+>;
+
+function pickForwardedCollectionOptions<T extends object>(
+	config: SurrealCollectionOptions<T>,
+): Partial<Pick<CollectionConfig<T, string>, ForwardedCollectionOptionKey>> {
+	const options: Record<string, unknown> = {};
+	for (const key of FORWARDED_COLLECTION_OPTION_KEYS) {
+		if (config[key] !== undefined) options[key] = config[key];
+	}
+	return options;
+}
 
 function modernSurrealCollectionOptions<T extends SyncedTable<object>>(
 	config: SurrealCollectionOptions<T>,
@@ -644,6 +682,7 @@ function modernSurrealCollectionOptions<T extends SyncedTable<object>>(
 	};
 
 	const base = queryCollectionOptions({
+		...pickForwardedCollectionOptions(config),
 		id: collectionId,
 		schema: createInsertSchema<T>(tableName),
 		getKey,
@@ -989,10 +1028,48 @@ export function surrealCollectionOptions<T extends SyncedTable<object>>(
 	return modernSurrealCollectionOptions(config);
 }
 
+// Every key of PersistedOnlyCollectionOptions. The type check below fails if
+// `persistedCollectionOptions` gains an option that isn't listed here, so it
+// can't be silently dropped again.
+const PERSISTED_ONLY_OPTION_KEYS = [
+	'persistence',
+	'schemaVersion',
+	'initialRender',
+] as const satisfies ReadonlyArray<keyof PersistedOnlyCollectionOptions>;
+type _AllPersistedOnlyOptionKeysListed = AssertNever<
+	Exclude<
+		keyof PersistedOnlyCollectionOptions,
+		(typeof PERSISTED_ONLY_OPTION_KEYS)[number]
+	>
+>;
+
+function splitPersistedOptions<T extends object>(
+	config: PersistedSurrealCollectionOptions<T>,
+): {
+	persistedOptions: PersistedOnlyCollectionOptions;
+	surrealConfig: SurrealCollectionOptions<T>;
+} {
+	const persistedOptions: Record<string, unknown> = {};
+	const surrealConfig: Record<string, unknown> = {};
+	const persistedKeys: ReadonlySet<string> = new Set(
+		PERSISTED_ONLY_OPTION_KEYS,
+	);
+	for (const [key, value] of Object.entries(config)) {
+		const target = persistedKeys.has(key)
+			? persistedOptions
+			: surrealConfig;
+		target[key] = value;
+	}
+	return {
+		persistedOptions: persistedOptions as PersistedOnlyCollectionOptions,
+		surrealConfig: surrealConfig as SurrealCollectionOptions<T>,
+	};
+}
+
 export function persistedSurrealCollectionOptions<
 	T extends SyncedTable<object>,
 >(config: PersistedSurrealCollectionOptions<T>) {
-	const { persistence, schemaVersion, ...surrealConfig } = config;
+	const { persistedOptions, surrealConfig } = splitPersistedOptions(config);
 
 	type Schema = StandardSchemaV1<Omit<T, 'id'> & { id?: T['id'] }, T>;
 	// InferSchemaOutput<Schema> is T at runtime, but TypeScript can't resolve the
@@ -1007,8 +1084,7 @@ export function persistedSurrealCollectionOptions<
 	> & { schema: Schema; utils: UtilsRecord };
 
 	return persistedCollectionOptions<Schema, string, UtilsRecord>({
-		persistence,
-		schemaVersion,
+		...persistedOptions,
 		...options,
 	});
 }
