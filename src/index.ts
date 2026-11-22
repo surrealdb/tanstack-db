@@ -17,7 +17,7 @@ import type {
 import { persistedCollectionOptions } from '@tanstack/db-sqlite-persistence-core';
 import type { QueryFunctionContext } from '@tanstack/query-core';
 import { queryCollectionOptions } from '@tanstack/query-db-collection';
-import { LoroDoc } from 'loro-crdt';
+import type { LoroDoc } from 'loro-crdt';
 import { Features, RecordId } from 'surrealdb';
 import { createLoroProfile } from './crdt';
 import {
@@ -77,6 +77,17 @@ export { toRecordKeyString } from './id';
 export * from './types';
 
 const NOOP = () => {};
+
+// loro-crdt (and its WASM binary) is only needed for CRDT collections, so it is
+// loaded on first use instead of at module evaluation time.
+let loroModule: Promise<typeof import('loro-crdt')> | undefined;
+const loadLoro = (): Promise<typeof import('loro-crdt')> => {
+	loroModule ??= import('loro-crdt').catch((error: unknown) => {
+		loroModule = undefined;
+		throw error;
+	});
+	return loroModule;
+};
 
 type Cleanup = () => void;
 
@@ -244,9 +255,12 @@ function modernSurrealCollectionOptions<T extends SyncedTable<object>>(
 			? tableNameOf(crdt.snapshotsTable)
 			: undefined;
 
-	const getDoc = (id: string): LoroDoc => {
+	const getDoc = async (id: string): Promise<LoroDoc> => {
 		const existing = docs.get(id);
 		if (existing) return existing;
+		const { LoroDoc } = await loadLoro();
+		const loaded = docs.get(id);
+		if (loaded) return loaded;
 		const doc = new LoroDoc();
 		docs.set(id, doc);
 		return doc;
@@ -397,7 +411,7 @@ function modernSurrealCollectionOptions<T extends SyncedTable<object>>(
 		writeType: 'insert' | 'update' = 'insert',
 	) => {
 		if (!crdtEnabled || !updatesTableName) return;
-		const doc = getDoc(id);
+		const doc = await getDoc(id);
 		let since: string | undefined;
 
 		if (snapshotsTableName) {
@@ -535,7 +549,7 @@ function modernSurrealCollectionOptions<T extends SyncedTable<object>>(
 
 				if (isStrictOnDemand && !activeSubsets.has(id)) return;
 
-				const doc = getDoc(id);
+				const doc = await getDoc(id);
 				const bytes = await decodeUpdateBytes(value, 'update');
 				if (!bytes.byteLength) return;
 				doc.import(bytes);
@@ -692,7 +706,7 @@ function modernSurrealCollectionOptions<T extends SyncedTable<object>>(
 				);
 				for (const update of updates) {
 					const id = idFromDocRef(update.doc);
-					const doc = getDoc(id);
+					const doc = await getDoc(id);
 					const bytes = await decodeUpdateBytes(update, 'update');
 					if (!bytes.byteLength) continue;
 					doc.import(bytes);
@@ -751,7 +765,7 @@ function modernSurrealCollectionOptions<T extends SyncedTable<object>>(
 				}
 
 				const id = toRecordKeyString(normalized.id);
-				const doc = getDoc(id);
+				const doc = await getDoc(id);
 				const vv = doc.oplogVersion();
 				const localChange: LocalChange<T> = {
 					type: 'insert',
@@ -816,7 +830,7 @@ function modernSurrealCollectionOptions<T extends SyncedTable<object>>(
 				}
 
 				const id = toRecordKeyString(mutationId);
-				const doc = getDoc(id);
+				const doc = await getDoc(id);
 				const vv = doc.oplogVersion();
 				const localChange: LocalChange<T> = {
 					type: 'update',
@@ -844,7 +858,7 @@ function modernSurrealCollectionOptions<T extends SyncedTable<object>>(
 					continue;
 				}
 
-				const doc = getDoc(id);
+				const doc = await getDoc(id);
 				const vv = doc.oplogVersion();
 				const localChange: LocalChange<T> = {
 					type: 'delete',
@@ -916,7 +930,7 @@ function modernSurrealCollectionOptions<T extends SyncedTable<object>>(
 								);
 								for (const update of updates) {
 									const id = idFromDocRef(update.doc);
-									const doc = getDoc(id);
+									const doc = await getDoc(id);
 									const bytes = await decodeUpdateBytes(
 										update,
 										'update',
