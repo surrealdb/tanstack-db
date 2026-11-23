@@ -31,14 +31,17 @@ export const subsetCacheKey = (subset: LoadSubsetOptions): string => {
 	);
 };
 
-const normalizeSubsetValuesInPlace = (
+// Reads the request; never writes to it. TanStack DB's `LoadSubsetOptions` are
+// immutable request data, so the preferred identities are only recorded in the
+// identity pool and returned for the caller.
+const collectPreferredRecordIds = (
 	value: unknown,
 	seen: WeakSet<object> = new WeakSet<object>(),
 	preferredByCanonical: Map<string, unknown> = new Map(),
 ): Map<string, unknown> => {
 	if (Array.isArray(value)) {
 		for (const entry of value) {
-			normalizeSubsetValuesInPlace(entry, seen, preferredByCanonical);
+			collectPreferredRecordIds(entry, seen, preferredByCanonical);
 		}
 		return preferredByCanonical;
 	}
@@ -51,16 +54,18 @@ const normalizeSubsetValuesInPlace = (
 	if (obj.type === 'val' && 'value' in obj) {
 		const canonical = asCanonicalRecordIdString(obj.value);
 		if (canonical) {
-			const preferred = preferRecordIdLikeIdentity(obj.value);
-			obj.value = preferred;
-			preferredByCanonical.set(canonical, preferred);
+			preferredByCanonical.set(
+				canonical,
+				preferRecordIdLikeIdentity(obj.value),
+			);
 		} else {
-			obj.value = preferRecordIdLikeIdentityDeep(obj.value);
+			// Primes the pool for nested record ids; the returned copy is dropped.
+			preferRecordIdLikeIdentityDeep(obj.value);
 		}
 	}
 
 	for (const child of Object.values(obj)) {
-		normalizeSubsetValuesInPlace(child, seen, preferredByCanonical);
+		collectPreferredRecordIds(child, seen, preferredByCanonical);
 	}
 
 	return preferredByCanonical;
@@ -70,7 +75,13 @@ export const primeRecordIdIdentityFromSubset = (
 	subset?: LoadSubsetOptions,
 ): Map<string, unknown> => {
 	if (!subset) return new Map();
-	return normalizeSubsetValuesInPlace(subset);
+	// Only the expressions carry values; `subscription` and `signal` are live
+	// objects that the walk has no business in.
+	return collectPreferredRecordIds([
+		subset.where,
+		subset.orderBy,
+		subset.cursor,
+	]);
 };
 
 const rebindRecordIdIdentityDeep = (
