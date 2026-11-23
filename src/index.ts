@@ -18,7 +18,7 @@ import { persistedCollectionOptions } from '@tanstack/db-sqlite-persistence-core
 import type { QueryFunctionContext } from '@tanstack/query-core';
 import { queryCollectionOptions } from '@tanstack/query-db-collection';
 import { LoroDoc } from 'loro-crdt';
-import { Features, RecordId } from 'surrealdb';
+import { Features, RecordId, type StringRecordId } from 'surrealdb';
 import { createLoroProfile } from './crdt';
 import {
 	normalizeRecordIdLikeFields,
@@ -37,6 +37,7 @@ import {
 	toEnvelope,
 	toStoredEnvelope,
 } from './internal/envelope';
+import { createLiveSubsets } from './internal/live-subsets';
 import {
 	firstRow,
 	omitUndefined,
@@ -49,6 +50,17 @@ import {
 	type MutationInput,
 } from './internal/schema';
 import {
+	recordFieldsToSurreal,
+	stringifyRecordIdsDeep,
+	toSurrealRecordId,
+	toTableRecordIdString,
+} from './internal/string-ids';
+import type {
+	PersistedStringRecordCollectionOptions,
+	StringRecordCollectionOptions,
+	StringRecordRow,
+} from './internal/string-record-types';
+import {
 	applyPreferredRecordIdIdentityToCollection,
 	primeRecordIdIdentityFromSubset,
 	subsetCacheKey,
@@ -59,6 +71,7 @@ import {
 	toTableOptions,
 	toTableResource,
 } from './internal/table-options';
+import { schemaTableOptions } from './schema';
 import { manageTable } from './table';
 import type {
 	AADContext,
@@ -74,6 +87,7 @@ import { fromBase64, fromBytes, toBase64, toBytes } from './util';
 export * from './crdt';
 export * from './encryption';
 export { toRecordKeyString } from './id';
+export type { SurrealSchemaTable } from './schema';
 export * from './types';
 
 const NOOP = () => {};
@@ -136,6 +150,8 @@ function modernSurrealCollectionOptions<T extends SyncedTable<object>>(
 		e2ee,
 		crdt,
 		syncMode: inputSyncMode,
+		recordIds: recordIdMode = 'native',
+		tables: schemaTables,
 	} = config;
 
 	if (!queryClient || !queryKey) {
@@ -149,8 +165,23 @@ function modernSurrealCollectionOptions<T extends SyncedTable<object>>(
 	// Subset transport keeps TanStack predicates aligned with SurrealQL pushdown.
 	const queryDrivenSyncMode: 'eager' | 'on-demand' = 'on-demand';
 	const queryDrivenUsesSubsets = queryDrivenSyncMode === 'on-demand';
-	const tableOptions = toTableOptions(table);
-	const tableName = tableOptions.name;
+	const inputTableOptions = toTableOptions(table);
+	const tableName = inputTableOptions.name;
+	const stringIds = recordIdMode === 'string';
+	const schemaOptions =
+		stringIds && schemaTables
+			? schemaTableOptions(schemaTables, tableName)
+			: undefined;
+	const tableOptions = {
+		...inputTableOptions,
+		relation: inputTableOptions.relation || schemaOptions?.relation,
+	};
+	// Record-link fields sent to SurrealDB as record ids in `recordIds: 'string'` mode.
+	const recordFields = [
+		'id',
+		...(tableOptions.relation ? ['in', 'out'] : []),
+		...(schemaOptions?.recordFields ?? []),
+	];
 	const collectionId = config.id ?? deriveCollectionId(tableName, queryKey);
 	const tableResource = toTableResource(table);
 	const activeSubsets = new ActiveSubsetTracker();
@@ -182,17 +213,40 @@ function modernSurrealCollectionOptions<T extends SyncedTable<object>>(
 		crdtApplyLocalChange(...args);
 	};
 
-	const tableAccess = manageTable<T>(db, tableOptions);
+	const tableAccess = manageTable<T>(
+		db,
+		tableOptions,
+		stringIds ? { recordFields: new Set(recordFields) } : undefined,
+	);
 	const docs = new Map<string, LoroDoc>();
 
 	const aadFor = (ctx: AADContext): Uint8Array =>
 		(e2ee?.aad ?? defaultAad)(ctx);
 
-	const getKey = (row: { id: string | RecordId }) => toRecordIdString(row.id);
+	const toIdString = (id: unknown): string =>
+		toTableRecordIdString(tableName, id);
+	const getKey = (row: { id: string | RecordId }) =>
+		stringIds ? toIdString(row.id) : toRecordIdString(row.id);
 	const normalizeMutationId = (id: string | RecordId): RecordId =>
 		toRecordId(tableName, id);
+	// The row id as TanStack DB sees it.
+	const toRowId = (id: string | RecordId): string | RecordId =>
+		stringIds ? toIdString(id) : normalizeMutationId(id);
+	// The record id sent to SurrealDB.
+	const toSurrealId = (id: string | RecordId): RecordId | StringRecordId =>
+		stringIds
+			? (toSurrealRecordId(toIdString(id)) as StringRecordId)
+			: normalizeMutationId(id);
+	const toSurrealFields = <R extends Record<string, unknown>>(row: R): R =>
+		stringIds ? recordFieldsToSurreal(row, recordFields) : row;
+	const deleteKeyFor = (id: string | RecordId): string =>
+		stringIds ? toIdString(id) : `${tableName}:${toRecordKeyString(id)}`;
 
 	const normalizeRow = (row: T): T => {
+		if (stringIds) {
+			const stringified = stringifyRecordIdsDeep(row);
+			return { ...stringified, id: toIdString(stringified.id) } as T;
+		}
 		const normalized = normalizeRecordIdLikeValueDeep(row) as T;
 		return {
 			...normalized,
@@ -216,7 +270,7 @@ function modernSurrealCollectionOptions<T extends SyncedTable<object>>(
 		const merged = {
 			...stripEnvelopeFields(row),
 			...(payload as Record<string, unknown>),
-			id: normalizeMutationId(row.id as string | RecordId),
+			id: toRowId(row.id as string | RecordId),
 		} as T;
 		return normalizeRow(merged);
 	};
@@ -252,9 +306,19 @@ function modernSurrealCollectionOptions<T extends SyncedTable<object>>(
 		return doc;
 	};
 
-	const docRef = (id: string): RecordId => new RecordId(tableName, id);
-	const idFromDocRef = (doc: string | RecordId): string =>
-		toRecordKeyString(doc);
+	// String mode keys CRDT documents by the full id, so `user:42` and
+	// `user:⟨42⟩` stay separate documents.
+	const docKeyOf = (id: string | RecordId): string =>
+		stringIds ? toIdString(id) : toRecordKeyString(id);
+	const docRef = (id: string): RecordId | StringRecordId =>
+		stringIds
+			? (toSurrealRecordId(id) as StringRecordId)
+			: new RecordId(tableName, id);
+	const idFromDocRef = (doc: string | RecordId): string => docKeyOf(doc);
+	// Encryption stays bound to the record key in both modes, so opting into
+	// string ids keeps existing encrypted updates readable.
+	const aadKeyOf = (id: string): string =>
+		stringIds ? toRecordKeyString(id) : id;
 
 	const resolveActor = (
 		id: string,
@@ -284,7 +348,7 @@ function modernSurrealCollectionOptions<T extends SyncedTable<object>>(
 		}
 		const envelope = toEnvelope(row as unknown as Record<string, unknown>);
 		if (!envelope) return new Uint8Array();
-		const id = idFromDocRef(row.doc);
+		const id = aadKeyOf(idFromDocRef(row.doc));
 		return e2ee.crypto.decrypt({
 			envelope,
 			aad: aadFor({
@@ -316,7 +380,7 @@ function modernSurrealCollectionOptions<T extends SyncedTable<object>>(
 			aad: aadFor({
 				table: targetTable ?? tableName,
 				baseTable: tableName,
-				id,
+				id: aadKeyOf(id),
 				kind,
 			}),
 		});
@@ -348,18 +412,22 @@ function modernSurrealCollectionOptions<T extends SyncedTable<object>>(
 				string,
 				unknown
 			>;
-			await db.upsert(normalizeMutationId(materialized.id)).merge(rest);
+			await db
+				.upsert(toSurrealId(materialized.id))
+				.merge(toSurrealFields(rest));
 			return;
 		}
 
 		const payload = await encodeBaseRow(
-			omitUndefined({
-				...(materialized as Record<string, unknown>),
-				id: undefined,
-			}),
+			toSurrealFields(
+				omitUndefined({
+					...(materialized as Record<string, unknown>),
+					id: undefined,
+				}),
+			),
 			id,
 		);
-		await db.upsert(normalizeMutationId(materialized.id)).merge(payload);
+		await db.upsert(toSurrealId(materialized.id)).merge(payload);
 	};
 
 	const hydratePlainRows = async (
@@ -469,24 +537,14 @@ function modernSurrealCollectionOptions<T extends SyncedTable<object>>(
 			live.subscribe(async (message) => {
 				if (message.action === 'KILLED') return;
 				const row = message.value as Record<string, unknown>;
-				const id = toRecordKeyString(row.id as string | RecordId);
-
-				const wasVisible = activeSubsets.has(id);
-				if (
-					isStrictOnDemand &&
-					!wasVisible &&
-					message.action !== 'DELETE'
-				)
-					return;
+				const rowId = row.id as string | RecordId;
 
 				if (message.action === 'DELETE') {
-					activeSubsets.deleteId(id);
-					if (isStrictOnDemand && !wasVisible) return;
 					ctx.begin();
 					try {
 						ctx.write({
 							type: 'delete',
-							key: `${tableName}:${id}`,
+							key: deleteKeyFor(rowId),
 						});
 					} finally {
 						ctx.commit();
@@ -554,19 +612,104 @@ function modernSurrealCollectionOptions<T extends SyncedTable<object>>(
 			};
 		};
 
+		// `collection.has` includes optimistic state, so a pending local delete
+		// would hide a row that sync still holds.
+		const acceptedSyncedKeys = () =>
+			ctx.collection._state.createSyncedKeyLookup();
+
+		const liveSubsets =
+			isOnDemandLike && !crdtEnabled
+				? createLiveSubsets<T>({
+						db,
+						table: tableOptions,
+						tracker: activeSubsets,
+						idOf: stringIds ? toIdString : undefined,
+						queryOptions: stringIds
+							? { recordFields: new Set(recordFields) }
+							: undefined,
+						onError,
+						loadRows: (subset) =>
+							tableAccess.loadSubset(
+								subset,
+							) as unknown as Promise<
+								Array<Record<string, unknown>>
+							>,
+						decode: decodeBaseRow,
+						writeRows: async (rows) => {
+							if (!rows.length) return;
+							const isSynced = acceptedSyncedKeys();
+							ctx.begin();
+							let receipt: unknown;
+							try {
+								for (const row of rows) {
+									ctx.write({
+										type: isSynced(getKey(row))
+											? 'update'
+											: 'insert',
+										value: row,
+									});
+								}
+							} finally {
+								receipt = ctx.commit();
+							}
+							await receipt;
+						},
+						evict: async (ids) => {
+							// Persistence can hold a row before core sees it, so always
+							// queue the delete. Core ignores one for an absent key.
+							const keys = ids.map((id) =>
+								stringIds ? id : `${tableName}:${id}`,
+							);
+							if (!keys.length) return;
+							ctx.begin();
+							let receipt: unknown;
+							try {
+								for (const key of keys) {
+									ctx.write({ type: 'delete', key });
+								}
+							} finally {
+								receipt = ctx.commit();
+							}
+							await receipt;
+						},
+						syncedRows: () =>
+							(
+								ctx.collection as unknown as {
+									_state?: {
+										syncedData?: {
+											values: () => Iterable<T>;
+										};
+									};
+								}
+							)._state?.syncedData?.values() ?? [],
+						invalidate: () => {
+							(
+								ctx as { invalidateLoadedSubsets?: () => void }
+							).invalidateLoadedSubsets?.();
+						},
+					})
+				: undefined;
+
 		const loadSubset = async (subset: LoadSubsetOptions) => {
 			if (!queryDrivenUsesSubsets) return;
-			const preferredFromSubset = primeRecordIdIdentityFromSubset(subset);
-			// Rebind before async rows arrive so RecordId predicates keep stable identity.
-			applyPreferredRecordIdIdentityToCollection(
-				ctx,
-				preferredFromSubset,
-			);
+			if (!stringIds) {
+				const preferredFromSubset =
+					primeRecordIdIdentityFromSubset(subset);
+				// Rebind before async rows arrive so RecordId predicates keep stable identity.
+				applyPreferredRecordIdIdentityToCollection(
+					ctx,
+					preferredFromSubset,
+				);
+			}
+			if (liveSubsets) {
+				await liveSubsets.load(subset);
+				return;
+			}
 			const key = subsetCacheKey(subset);
 			const rows = await tableAccess.loadSubset(subset);
 			const ids = new Set(
 				(rows as unknown as Array<Record<string, unknown>>).map((row) =>
-					toRecordKeyString(row.id as string | RecordId),
+					docKeyOf(row.id as string | RecordId),
 				),
 			);
 			activeSubsets.set(key, ids);
@@ -611,7 +754,11 @@ function modernSurrealCollectionOptions<T extends SyncedTable<object>>(
 
 		const unloadSubset = (subset: LoadSubsetOptions) => {
 			if (!queryDrivenUsesSubsets) return;
-			primeRecordIdIdentityFromSubset(subset);
+			if (!stringIds) primeRecordIdIdentityFromSubset(subset);
+			if (liveSubsets) {
+				liveSubsets.unload(subset);
+				return;
+			}
 			const key = subsetCacheKey(subset);
 			activeSubsets.delete(key);
 			if (activeSubsets.size === 0) {
@@ -630,6 +777,7 @@ function modernSurrealCollectionOptions<T extends SyncedTable<object>>(
 
 		const cleanup = () => {
 			killed = true;
+			liveSubsets?.cleanup();
 			activeSubsets.clear();
 			cleanupBaseLive();
 			cleanupUpdateLive();
@@ -645,14 +793,16 @@ function modernSurrealCollectionOptions<T extends SyncedTable<object>>(
 
 	const base = queryCollectionOptions({
 		id: collectionId,
-		schema: createInsertSchema<T>(tableName),
+		schema: createInsertSchema<T>(tableName, recordIdMode),
 		getKey,
 		queryKey,
 		queryClient,
 		syncMode: queryDrivenSyncMode,
 		queryFn: async ({ meta }: QueryFunctionContext) => {
 			try {
-				primeRecordIdIdentityFromSubset(meta?.loadSubsetOptions);
+				if (!stringIds) {
+					primeRecordIdIdentityFromSubset(meta?.loadSubsetOptions);
+				}
 
 				if (queryDrivenUsesSubsets && !meta?.loadSubsetOptions) {
 					return [] as T[];
@@ -714,10 +864,12 @@ function modernSurrealCollectionOptions<T extends SyncedTable<object>>(
 				const normalized = normalizeRow(mutation.modified as T);
 				if (!crdtEnabled) {
 					const idKey = toRecordKeyString(normalized.id);
-					const payload = omitUndefined({
-						...(normalized as Record<string, unknown>),
-						id: undefined,
-					});
+					const payload = toSurrealFields(
+						omitUndefined({
+							...(normalized as Record<string, unknown>),
+							id: undefined,
+						}),
+					);
 					const recordPayload = await encodeBaseRow(payload, idKey);
 
 					if (isTempId(normalized.id, tableName)) {
@@ -736,21 +888,21 @@ function modernSurrealCollectionOptions<T extends SyncedTable<object>>(
 								: normalized.id;
 						const resolved = {
 							...normalized,
-							id: normalizeMutationId(createdId),
+							id: toRowId(createdId),
 						} as T;
 						writeUtils.writeUpsert?.(resolved);
 						continue;
 					}
 
 					await db.insert(tableResource, {
-						id: normalizeMutationId(normalized.id),
+						id: toSurrealId(normalized.id),
 						...recordPayload,
 					});
 					writeUtils.writeUpsert?.(normalized);
 					continue;
 				}
 
-				const id = toRecordKeyString(normalized.id);
+				const id = docKeyOf(normalized.id);
 				const doc = getDoc(id);
 				const vv = doc.oplogVersion();
 				const localChange: LocalChange<T> = {
@@ -769,22 +921,43 @@ function modernSurrealCollectionOptions<T extends SyncedTable<object>>(
 			const writeUtils = getWriteUtils(params.collection.utils);
 			for (const mutation of params.transaction.mutations) {
 				if (mutation.type !== 'update') continue;
-				const mutationId = normalizeMutationId(
-					mutation.key as RecordId | string,
-				);
+				const mutationKey = mutation.key as RecordId | string;
+				const mutationId = toSurrealId(mutationKey);
+				const rowId = toRowId(mutationKey);
+				const modified = {
+					...(mutation.modified as Record<string, unknown>),
+				};
 				const normalizedModified = omitUndefined(
-					normalizeRecordIdLikeFields({
-						...(mutation.modified as Record<string, unknown>),
-					}) as Record<string, unknown>,
+					(stringIds
+						? stringifyRecordIdsDeep(modified)
+						: normalizeRecordIdLikeFields(modified)) as Record<
+						string,
+						unknown
+					>,
 				);
 				const normalized = normalizeRow({
 					...(normalizedModified as Partial<T>),
-					id: mutationId,
+					id: rowId,
 				} as T);
+				// String mode writes only what changed, so an edit can never
+				// rewrite a record link it did not touch.
+				const fieldsToWrite = stringIds
+					? omitUndefined(
+							stringifyRecordIdsDeep({
+								...(mutation.changes as Record<
+									string,
+									unknown
+								>),
+								id: undefined,
+							}),
+						)
+					: normalizedModified;
 
 				if (!crdtEnabled) {
 					if (!e2eeEnabled) {
-						await db.update(mutationId).merge(normalizedModified);
+						await db
+							.update(mutationId)
+							.merge(toSurrealFields(fieldsToWrite));
 						writeUtils.writeUpsert?.(normalized);
 						continue;
 					}
@@ -798,15 +971,15 @@ function modernSurrealCollectionOptions<T extends SyncedTable<object>>(
 					const currentRow = currentRows[0];
 					const decodedCurrent = currentRow
 						? await decodeBaseRow(currentRow)
-						: ({ id: mutationId } as T);
+						: ({ id: rowId } as T);
 					const merged = {
 						...(decodedCurrent as Record<string, unknown>),
-						...(normalizedModified as Record<string, unknown>),
+						...(fieldsToWrite as Record<string, unknown>),
 					};
 					delete merged.id;
 					const encoded = await encodeBaseRow(
-						omitUndefined(merged),
-						toRecordKeyString(mutationId),
+						toSurrealFields(omitUndefined(merged)),
+						toRecordKeyString(rowId),
 					);
 					await db.update(mutationId).merge(encoded);
 					writeUtils.writeUpsert?.(
@@ -815,7 +988,7 @@ function modernSurrealCollectionOptions<T extends SyncedTable<object>>(
 					continue;
 				}
 
-				const id = toRecordKeyString(mutationId);
+				const id = docKeyOf(rowId);
 				const doc = getDoc(id);
 				const vv = doc.oplogVersion();
 				const localChange: LocalChange<T> = {
@@ -834,13 +1007,13 @@ function modernSurrealCollectionOptions<T extends SyncedTable<object>>(
 			const writeUtils = getWriteUtils(params.collection.utils);
 			for (const mutation of params.transaction.mutations) {
 				if (mutation.type !== 'delete') continue;
-				const mutationId = normalizeMutationId(
-					mutation.key as RecordId | string,
-				);
-				const id = toRecordKeyString(mutationId);
+				const mutationKey = mutation.key as RecordId | string;
+				const mutationId = toSurrealId(mutationKey);
+				const rowId = toRowId(mutationKey);
+				const id = docKeyOf(rowId);
 				if (!crdtEnabled) {
 					await db.delete(mutationId);
-					writeUtils.writeDelete?.(`${tableName}:${id}`);
+					writeUtils.writeDelete?.(deleteKeyFor(rowId));
 					continue;
 				}
 
@@ -848,12 +1021,12 @@ function modernSurrealCollectionOptions<T extends SyncedTable<object>>(
 				const vv = doc.oplogVersion();
 				const localChange: LocalChange<T> = {
 					type: 'delete',
-					value: { id: mutationId } as T,
+					value: { id: rowId } as T,
 				};
 				applyCrdtLocalChange(doc, localChange);
 				const bytes = doc.export({ mode: 'update', from: vv });
 				await persistCrdtUpdate(id, bytes, localChange);
-				writeUtils.writeDelete?.(`${tableName}:${id}`);
+				writeUtils.writeDelete?.(deleteKeyFor(rowId));
 			}
 		}) as DeleteMutationFn<T, string, UtilsRecord>,
 	} as never) as unknown as SurrealCollectionOptionsReturn<T>;
@@ -975,9 +1148,7 @@ function modernSurrealCollectionOptions<T extends SyncedTable<object>>(
 	} as SurrealCollectionOptionsReturn<T>;
 }
 
-export function surrealCollectionOptions<T extends SyncedTable<object>>(
-	config: SurrealCollectionOptions<T>,
-): CollectionConfig<
+type SurrealCollectionResult<T extends SyncedTable<object>> = CollectionConfig<
 	T,
 	string,
 	StandardSchemaV1<MutationInput<T>, T>,
@@ -985,13 +1156,24 @@ export function surrealCollectionOptions<T extends SyncedTable<object>>(
 > & {
 	schema: StandardSchemaV1<MutationInput<T>, T>;
 	utils: UtilsRecord;
-} {
+};
+
+export function surrealCollectionOptions<
+	T extends SyncedTable<object> & { id: RecordId },
+>(
+	config: StringRecordCollectionOptions<T>,
+): SurrealCollectionResult<StringRecordRow<T>>;
+export function surrealCollectionOptions<T extends SyncedTable<object>>(
+	config: SurrealCollectionOptions<T>,
+): SurrealCollectionResult<T>;
+// biome-ignore lint/suspicious/noExplicitAny: the overloads carry the public types.
+export function surrealCollectionOptions(config: any): any {
 	return modernSurrealCollectionOptions(config);
 }
 
-export function persistedSurrealCollectionOptions<
-	T extends SyncedTable<object>,
->(config: PersistedSurrealCollectionOptions<T>) {
+function createPersistedOptions<T extends SyncedTable<object>>(
+	config: PersistedSurrealCollectionOptions<T>,
+) {
 	const { persistence, schemaVersion, ...surrealConfig } = config;
 
 	type Schema = StandardSchemaV1<Omit<T, 'id'> & { id?: T['id'] }, T>;
@@ -1011,6 +1193,21 @@ export function persistedSurrealCollectionOptions<
 		schemaVersion,
 		...options,
 	});
+}
+
+export function persistedSurrealCollectionOptions<
+	T extends SyncedTable<object> & { id: RecordId },
+>(
+	config: PersistedStringRecordCollectionOptions<T>,
+): ReturnType<typeof createPersistedOptions<StringRecordRow<T>>>;
+export function persistedSurrealCollectionOptions<
+	T extends SyncedTable<object>,
+>(
+	config: PersistedSurrealCollectionOptions<T>,
+): ReturnType<typeof createPersistedOptions<T>>;
+// biome-ignore lint/suspicious/noExplicitAny: the overloads carry the public types.
+export function persistedSurrealCollectionOptions(config: any): any {
+	return createPersistedOptions(config);
 }
 
 declare module '@tanstack/db' {

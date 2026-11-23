@@ -145,6 +145,8 @@ type SurrealCollectionOptions<T> = {
 	queryClient: QueryClient;
 	queryKey: readonly unknown[];
 	syncMode?: 'eager' | 'on-demand' | 'progressive';
+	recordIds?: 'native' | 'string'; // default 'native'
+	tables?: readonly SurrealSchemaTable[]; // SurrealKit schema tables, for recordIds: 'string'
 	e2ee?: {
 		enabled: boolean;
 		crypto: CryptoProvider;
@@ -168,6 +170,74 @@ type SurrealCollectionOptions<T> = {
 `id` is optional. When omitted, the adapter derives a stable collection id from
 the Surreal table name and `queryKey` so TanStack DB persistence wrappers can
 reuse the same persisted collection state across restarts.
+
+## String record ids
+
+By default rows carry SurrealDB `RecordId` instances. TanStack DB compares
+class instances by reference and cannot hash them for `useLiveQuery`
+dependencies ([TanStack/db#2459](https://github.com/TanStack/db/issues/2459)),
+so a filter like `eq(user.id, userId)` only matches when `userId` is the very
+same object the adapter holds.
+
+Set `recordIds: 'string'` to give TanStack DB plain strings instead. Every
+record id read from SurrealDB (the row `id` and any other field, at any depth)
+becomes its SurrealQL string, exactly `RecordId#toString()`: `user:abc`,
+`user:42` for a number key, `user:⟨42⟩` for the string key `"42"`. The row
+`id` is also the collection key.
+
+On the way back, the adapter sends the row `id` and the table's record-link
+fields to SurrealDB as record ids, on writes and in pushed-down `where` filters
+(`eq`, `inArray`, ...). Other string fields stay text, since a string like
+`org:abc` can be ordinary data. Updates send only the fields that changed.
+
+A string does not say whether it is a link, and record users cannot read table
+definitions at runtime, so link fields come from your schema at build time.
+Compile it with SurrealKit, which needs no database connection:
+
+```bash
+surrealkit compile --out src/schema.json
+```
+
+If your schema uses template variables, pass them with `--var`. Then pass the
+document's `tables` directly. Use a named import with a bundler that tree-shakes
+JSON, such as Vite, so the document's access definitions stay out of the client
+bundle.
+
+```tsx
+import { surrealCollectionOptions } from '@surrealdb/tanstack-db';
+import { eq, useLiveQuery } from '@tanstack/react-db';
+import { tables } from './schema.json';
+import type { Profile } from './schema.generated'; // uses RecordId
+
+const profiles = createCollection(
+	surrealCollectionOptions<Profile>({
+		db,
+		table: 'profile',
+		tables,
+		queryClient,
+		queryKey: ['profile'],
+		syncMode: 'on-demand',
+		recordIds: 'string',
+	}),
+);
+
+const { data: orgProfiles } = useLiveQuery({
+	query: (q) =>
+		q
+			.from({ profile: profiles })
+			.where(({ profile }) => eq(profile.orgId, 'org:acme')),
+});
+
+await profiles.insert({ orgId: 'org:acme', bio: 'Hi' }); // stored as a record link
+```
+
+With a `RecordId` row type, the collection's rows use strings, and leaving out
+`tables` is a type error when the row has record links. Compare
+against the string form, e.g. `String(recordId)`.
+
+The adapter throws on a field typed as both a record and a string, since those
+values cannot be told apart. Links inside undeclared `FLEXIBLE` object
+keys are not in the schema, so they are read as strings and written as text.
 
 ## E2EE
 
@@ -444,6 +514,20 @@ const ownerFiles = createLiveQueryCollection((q) =>
 
 await ownerFiles.preload();
 ```
+
+### How on-demand subsets stay live
+
+In `on-demand` and `progressive` modes, each subset TanStack DB loads gets its own `LIVE SELECT`, filtered by that subset's `where`:
+
+- **New, changed and deleted rows** that match the filter stream in. Rows that stop matching are removed, unless another loaded subset still holds them.
+- **Ordered, limited subsets** subscribe only to their window. After the first page loads, the live query is bounded at the last row's leading sort value (`name <= 'b'` for `orderBy(name).limit(n)`), so changes further down the table are not sent. When a row leaves the window, TanStack DB loads the next page as usual.
+- **A default sort** applies to limited or offset subsets with no `orderBy`: they sort by `id`, and `id` is the last tiebreaker for every ordered subset, so pages are stable.
+- **Unloading a subset** kills its live query and keeps its rows, so a remounted query renders immediately. The next load reconciles anything that changed in the meantime.
+- **After a reconnect**, every loaded subset is refetched and resubscribed, since SurrealDB does not replay missed live events.
+
+`LIVE SELECT` has no `ORDER BY` or `LIMIT`, so a window is a `WHERE` bound on the leading sort column. Rows tied with the last row's value are included.
+
+CRDT collections keep the existing per-document replication.
 
 ## Key Wrapping / Multi-Principal Access
 

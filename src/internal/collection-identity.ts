@@ -1,6 +1,7 @@
 import type { OperationConfig, Transaction } from '@tanstack/db';
 import { hashKey } from '@tanstack/query-core';
 import { asCanonicalRecordIdString } from '../id';
+import { recordIdToString } from './string-ids';
 
 const SURREAL_COLLECTION_ID_PREFIX = 'surreal';
 
@@ -19,6 +20,8 @@ const normalizeDeleteKeyAgainstState = (
 	key: unknown,
 ): unknown => {
 	if (state.has(key)) return key;
+	const asString = recordIdToString(key);
+	if (asString !== undefined && state.has(asString)) return asString;
 	const canonical = asCanonicalRecordIdString(key);
 	if (!canonical) return key;
 	return state.has(canonical) ? canonical : key;

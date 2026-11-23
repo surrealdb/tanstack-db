@@ -1,6 +1,8 @@
 import type { StandardSchemaV1 } from '@standard-schema/spec';
 import { RecordId } from 'surrealdb';
 import { normalizeRecordIdLikeFields, toRecordIdString } from '../id';
+import type { RecordIdMode } from '../types';
+import { stringifyRecordIdsDeep, toTableRecordIdString } from './string-ids';
 
 const TEMP_ID_PREFIX = '__temp__';
 
@@ -26,6 +28,7 @@ export const isTempId = (id: string | RecordId, tableName: string): boolean => {
 
 export function createInsertSchema<T extends { id: string | RecordId }>(
 	tableName: string,
+	recordIds: RecordIdMode = 'native',
 ): StandardSchemaV1<MutationInput<T>, T> {
 	return {
 		'~standard': {
@@ -40,6 +43,17 @@ export function createInsertSchema<T extends { id: string | RecordId }>(
 					return {
 						issues: [{ message: 'Insert data must be an object.' }],
 					};
+				}
+
+				if (recordIds === 'string') {
+					const data = stringifyRecordIdsDeep({
+						...(value as Record<string, unknown>),
+					});
+					data.id = toTableRecordIdString(
+						tableName,
+						data.id ?? createTempRecordId(tableName),
+					);
+					return { value: data as T };
 				}
 
 				const data = normalizeRecordIdLikeFields({

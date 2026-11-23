@@ -89,7 +89,7 @@ type SurrealRecordIdLike = {
 	toString: () => unknown;
 };
 
-const isCrossRuntimeRecordIdObject = (
+export const isCrossRuntimeRecordIdObject = (
 	value: unknown,
 ): value is SurrealRecordIdLike => {
 	if (!value || typeof value !== 'object' || value instanceof RecordId) {

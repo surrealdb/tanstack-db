@@ -10,6 +10,7 @@ import type { LoroDoc } from 'loro-crdt';
 import type { RecordId, Surreal, Table } from 'surrealdb';
 
 import type { CryptoProvider } from './encryption';
+import type { SurrealSchemaTable } from './schema';
 
 export type Bytes = Uint8Array;
 
@@ -97,7 +98,27 @@ export type SurrealCollectionOptions<T extends object> = Omit<
 	e2ee?: SurrealE2EEOptions;
 	crdt?: SurrealCRDTOptions<T>;
 	onError?: (error: unknown) => void;
+	/**
+	 * How record ids are represented in the rows TanStack DB sees.
+	 *
+	 * - `'native'` (default): `RecordId` instances.
+	 * - `'string'`: plain strings in SurrealQL form (`RecordId#toString()`,
+	 *   e.g. `user:abc`, `user:42`, `user:⟨42⟩`), so they compare by value in
+	 *   `eq(...)` and hash in `useLiveQuery`. The row `id` and the record-link
+	 *   fields in `tables` are converted back to record ids when sent to
+	 *   SurrealDB. Pass a row type with `RecordId` fields (such as a generated
+	 *   one) to require `tables`, or a row type whose `id` is already a `string`.
+	 */
+	recordIds?: [T] extends [{ id: string }] ? RecordIdMode : 'native';
+	/**
+	 * The `tables` of a SurrealKit schema document (`surrealkit compile`), used
+	 * by `recordIds: 'string'` to find this table's record-link fields. Use a
+	 * named import so the document's access definitions stay out of the bundle.
+	 */
+	tables?: readonly SurrealSchemaTable[];
 };
+
+export type RecordIdMode = 'native' | 'string';
 
 export type PersistedSurrealCollectionOptions<T extends object> =
 	SurrealCollectionOptions<T> & {
