@@ -94,6 +94,13 @@ export type SurrealCollectionOptions<T extends object> = Omit<
 	queryKey: readonly unknown[];
 	queryClient: QueryClient;
 	syncMode?: AdapterSyncMode;
+	/**
+	 * TanStack Query retry policy for on-demand subset loads. Falls back to the
+	 * QueryClient's default, then to three retries for lost connections only.
+	 */
+	retry?: import('./internal/subset-loader').SubsetRetryOptions['retry'];
+	/** Delay between subset load retries. Falls back to the QueryClient's default. */
+	retryDelay?: import('./internal/subset-loader').SubsetRetryOptions['retryDelay'];
 	e2ee?: SurrealE2EEOptions;
 	crdt?: SurrealCRDTOptions<T>;
 	onError?: (error: unknown) => void;

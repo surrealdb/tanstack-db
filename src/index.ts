@@ -37,6 +37,7 @@ import {
 	toEnvelope,
 	toStoredEnvelope,
 } from './internal/envelope';
+import { createLiveSubsets } from './internal/live-subsets';
 import {
 	firstRow,
 	omitUndefined,
@@ -53,6 +54,7 @@ import {
 	primeRecordIdIdentityFromSubset,
 	subsetCacheKey,
 } from './internal/subset-identity';
+import { createSubsetLoader } from './internal/subset-loader';
 import { ActiveSubsetTracker } from './internal/subset-tracker';
 import {
 	tableNameOf,
@@ -184,6 +186,16 @@ function modernSurrealCollectionOptions<T extends SyncedTable<object>>(
 
 	const tableAccess = manageTable<T>(db, tableOptions);
 	const docs = new Map<string, LoroDoc>();
+	const loadSubsetRows = createSubsetLoader({
+		queryClient,
+		queryKey,
+		retry: config.retry,
+		retryDelay: config.retryDelay,
+		load: (subset) =>
+			tableAccess.loadSubset(subset) as unknown as Promise<
+				Array<Record<string, unknown>>
+			>,
+	});
 
 	const aadFor = (ctx: AADContext): Uint8Array =>
 		(e2ee?.aad ?? defaultAad)(ctx);
@@ -395,6 +407,7 @@ function modernSurrealCollectionOptions<T extends SyncedTable<object>>(
 		begin: () => void,
 		commit: () => void,
 		writeType: 'insert' | 'update' = 'insert',
+		isRetired: () => boolean = () => false,
 	) => {
 		if (!crdtEnabled || !updatesTableName) return;
 		const doc = getDoc(id);
@@ -440,6 +453,7 @@ function modernSurrealCollectionOptions<T extends SyncedTable<object>>(
 			doc.import(bytes);
 		}
 
+		if (isRetired()) return;
 		const materialized = normalizeRow(materializeCrdt(doc, id));
 		begin();
 		try {
@@ -456,13 +470,16 @@ function modernSurrealCollectionOptions<T extends SyncedTable<object>>(
 		let cleanupUpdateLive: Cleanup = NOOP;
 		let killed = false;
 
-		const ensureBaseLive = async () => {
+		// Direct loads, by request, so an unload or cleanup can retire them.
+		const directLoads = new Map<LoadSubsetOptions, AbortController>();
+
+		const ensureBaseLive = async (isRetired?: () => boolean) => {
 			if (cleanupBaseLive !== NOOP) return;
 			if (!db.isFeatureSupported?.(Features.LiveQueries)) return;
 			const live = (await db.live(
 				tableResource,
 			)) as unknown as LiveSubscriptionLike;
-			if (killed) {
+			if (killed || isRetired?.()) {
 				await live.kill();
 				return;
 			}
@@ -471,17 +488,7 @@ function modernSurrealCollectionOptions<T extends SyncedTable<object>>(
 				const row = message.value as Record<string, unknown>;
 				const id = toRecordKeyString(row.id as string | RecordId);
 
-				const wasVisible = activeSubsets.has(id);
-				if (
-					isStrictOnDemand &&
-					!wasVisible &&
-					message.action !== 'DELETE'
-				)
-					return;
-
 				if (message.action === 'DELETE') {
-					activeSubsets.deleteId(id);
-					if (isStrictOnDemand && !wasVisible) return;
 					ctx.begin();
 					try {
 						ctx.write({
@@ -511,7 +518,7 @@ function modernSurrealCollectionOptions<T extends SyncedTable<object>>(
 			};
 		};
 
-		const ensureUpdateLive = async () => {
+		const ensureUpdateLive = async (isRetired?: () => boolean) => {
 			if (!crdtEnabled || !updatesTable) return;
 			if (cleanupUpdateLive !== NOOP) return;
 			if (!db.isFeatureSupported?.(Features.LiveQueries)) return;
@@ -519,7 +526,7 @@ function modernSurrealCollectionOptions<T extends SyncedTable<object>>(
 			const live = (await db.live(
 				updatesTable,
 			)) as unknown as LiveSubscriptionLike;
-			if (killed) {
+			if (killed || isRetired?.()) {
 				await live.kill();
 				return;
 			}
@@ -554,6 +561,73 @@ function modernSurrealCollectionOptions<T extends SyncedTable<object>>(
 			};
 		};
 
+		// `collection.has` includes optimistic state, so a pending local delete
+		// would hide a row that sync still holds.
+		const acceptedSyncedKeys = () =>
+			ctx.collection._state.createSyncedKeyLookup();
+
+		const liveSubsets =
+			isOnDemandLike && !crdtEnabled
+				? createLiveSubsets<T>({
+						db,
+						table: tableOptions,
+						tracker: activeSubsets,
+						onError,
+						loadRows: loadSubsetRows,
+						decode: decodeBaseRow,
+						writeRows: async (rows) => {
+							if (!rows.length) return;
+							const isSynced = acceptedSyncedKeys();
+							ctx.begin();
+							let receipt: unknown;
+							try {
+								for (const row of rows) {
+									ctx.write({
+										type: isSynced(getKey(row))
+											? 'update'
+											: 'insert',
+										value: row,
+									});
+								}
+							} finally {
+								receipt = ctx.commit();
+							}
+							await receipt;
+						},
+						evict: async (ids) => {
+							// Persistence can hold a row before core sees it, so always
+							// queue the delete. Core ignores one for an absent key.
+							const keys = ids.map((id) => `${tableName}:${id}`);
+							if (!keys.length) return;
+							ctx.begin();
+							let receipt: unknown;
+							try {
+								for (const key of keys) {
+									ctx.write({ type: 'delete', key });
+								}
+							} finally {
+								receipt = ctx.commit();
+							}
+							await receipt;
+						},
+						syncedRows: () =>
+							(
+								ctx.collection as unknown as {
+									_state?: {
+										syncedData?: {
+											values: () => Iterable<T>;
+										};
+									};
+								}
+							)._state?.syncedData?.values() ?? [],
+						invalidate: () => {
+							(
+								ctx as { invalidateLoadedSubsets?: () => void }
+							).invalidateLoadedSubsets?.();
+						},
+					})
+				: undefined;
+
 		const loadSubset = async (subset: LoadSubsetOptions) => {
 			if (!queryDrivenUsesSubsets) return;
 			const preferredFromSubset = primeRecordIdIdentityFromSubset(subset);
@@ -562,8 +636,34 @@ function modernSurrealCollectionOptions<T extends SyncedTable<object>>(
 				ctx,
 				preferredFromSubset,
 			);
+			if (liveSubsets) {
+				await liveSubsets.load(subset);
+				return;
+			}
+			const acquisition = new AbortController();
+			const retire = () => acquisition.abort();
+			const isRetired = () => acquisition.signal.aborted;
+			if (subset.signal?.aborted) retire();
+			subset.signal?.addEventListener('abort', retire, { once: true });
+			directLoads.set(subset, acquisition);
+			try {
+				await loadDirectSubset(subset, acquisition.signal, isRetired);
+			} finally {
+				subset.signal?.removeEventListener('abort', retire);
+				if (directLoads.get(subset) === acquisition) {
+					directLoads.delete(subset);
+				}
+			}
+		};
+
+		const loadDirectSubset = async (
+			subset: LoadSubsetOptions,
+			signal: AbortSignal,
+			isRetired: () => boolean,
+		) => {
 			const key = subsetCacheKey(subset);
-			const rows = await tableAccess.loadSubset(subset);
+			const rows = await loadSubsetRows(subset, signal);
+			if (isRetired()) return;
 			const ids = new Set(
 				(rows as unknown as Array<Record<string, unknown>>).map((row) =>
 					toRecordKeyString(row.id as string | RecordId),
@@ -593,25 +693,32 @@ function modernSurrealCollectionOptions<T extends SyncedTable<object>>(
 					ctx.commit,
 					'insert',
 				);
-				await ensureBaseLive();
+				if (!isRetired()) await ensureBaseLive(isRetired);
 				return;
 			}
 
 			for (const id of ids) {
+				if (isRetired()) return;
 				await hydrateCrdtDoc(
 					id,
 					upsertWrite,
 					ctx.begin,
 					ctx.commit,
 					'insert',
+					isRetired,
 				);
 			}
-			await ensureUpdateLive();
+			if (!isRetired()) await ensureUpdateLive(isRetired);
 		};
 
 		const unloadSubset = (subset: LoadSubsetOptions) => {
 			if (!queryDrivenUsesSubsets) return;
 			primeRecordIdIdentityFromSubset(subset);
+			if (liveSubsets) {
+				liveSubsets.unload(subset);
+				return;
+			}
+			directLoads.get(subset)?.abort();
 			const key = subsetCacheKey(subset);
 			activeSubsets.delete(key);
 			if (activeSubsets.size === 0) {
@@ -630,6 +737,8 @@ function modernSurrealCollectionOptions<T extends SyncedTable<object>>(
 
 		const cleanup = () => {
 			killed = true;
+			for (const acquisition of directLoads.values()) acquisition.abort();
+			liveSubsets?.cleanup();
 			activeSubsets.clear();
 			cleanupBaseLive();
 			cleanupUpdateLive();
